@@ -1,0 +1,60 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // ===============================================================
+    // Security Rules for Chipotle Discord Bot
+    // ===============================================================
+    //
+    // IMPORTANT: The bot currently uses the Firebase Client SDK.
+    // For production, you should migrate to the Firebase Admin SDK
+    // (which bypasses rules entirely) so the bot can read/write
+    // freely while these rules lock down direct browser access.
+    //
+    // Until then, these rules restrict public access. If the bot
+    // stops working after deploying these rules, it means the bot's
+    // requests are being blocked — switch to Admin SDK to fix.
+    // ===============================================================
+
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    function isAdmin() {
+      return isAuthenticated() &&
+        (get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'admin' ||
+          (request.auth.token.email == "taquerox0@gmail.com" && request.auth.token.email_verified == true));
+    }
+
+    // Bot config: readable by authenticated users, writable by admins
+    match /config/bot {
+      allow read: if isAuthenticated();
+      allow write: if isAdmin();
+    }
+
+    // Orders: users can read own orders, admins can read/write all
+    match /orders/{orderId} {
+      allow read: if isAuthenticated() &&
+        (resource.data.userId == request.auth.uid || isAdmin());
+      allow create: if isAuthenticated();
+      allow update: if isAdmin();
+      allow delete: if isAdmin();
+    }
+
+    // User profiles
+    match /users/{userId} {
+      allow read: if isAuthenticated() && request.auth.uid == userId;
+      allow write: if isAdmin();
+    }
+
+    // Blacklist collection
+    match /blacklist/{userId} {
+      allow read: if isAuthenticated();
+      allow write: if isAdmin();
+    }
+
+    // Deny everything else by default
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

@@ -1,0 +1,60 @@
+{
+  "entities": {
+    "botConfig": {
+      "title": "Bot Configuration",
+      "description": "Customizable texts for the Discord bot.",
+      "type": "object",
+      "properties": {
+        "welcomeMessage": {
+          "type": "string",
+          "description": "The prompt after starting /order."
+        },
+        "entreePrompt": {
+          "type": "string",
+          "description": "The text when selecting an entree."
+        },
+        "proteinPrompt": {
+          "type": "string",
+          "description": "The text when selecting protein."
+        },
+        "checkoutMessage": {
+          "type": "string",
+          "description": "The instructions before payment."
+        },
+        "successMessage": {
+          "type": "string",
+          "description": "The confirmation after payment."
+        }
+      }
+    },
+    "orders": {
+      "title": "Order",
+      "description": "A record of a Chipotle order.",
+      "type": "object",
+      "properties": {
+        "userId": { "type": "string" },
+        "guildId": { "type": "string" },
+        "orderData": { "type": "string" },
+        "userInfo": { "type": "string" },
+        "status": { "type": "string", "enum": ["pending", "paid", "fulfilled"] },
+        "stripeSessionId": { "type": "string" },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["userId", "orderData", "userInfo", "status", "createdAt"]
+    }
+  },
+  "firestore": {
+    "/config/bot": {
+      "schema": "botConfig",
+      "description": "Global bot configuration settings (legacy/startup only)."
+    },
+    "/guilds/{guildId}/config/bot": {
+      "schema": "botConfig",
+      "description": "Per-guild bot configuration (webhookUrl, statusChannelId, payment methods, prices, etc.)."
+    },
+    "/orders/{orderId}": {
+      "schema": "orders",
+      "description": "Collection of all orders (includes guildId field for multi-server support)."
+    }
+  }
+}

@@ -1,0 +1,5 @@
+{
+  "name": "Chipotle Discord Bot",
+  "description": "An automated Discord bot for Chipotle entree orders with full customization and webhook integration.",
+  "requestFramePermissions": []
+}
