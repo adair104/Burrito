@@ -1,12 +1,7 @@
 import express from 'express';
 import { createServer as createViteServer } from 'vite';
-import { createServer as createHttpServer } from 'http';
-import { WebSocketServer } from 'ws';
-import pty from 'node-pty';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import fs from 'fs';
-import puppeteer from 'puppeteer-core';
 import {
   Client,
   GatewayIntentBits,
@@ -26,56 +21,13 @@ import {
   ComponentType,
   ModalActionRowComponentBuilder,
   AttachmentBuilder,
-  MessageFlags,
-  PermissionFlagsBits
+  MessageFlags
 } from 'discord.js';
 import dotenv from 'dotenv';
+import Stripe from 'stripe';
 import { db, serverTimestamp, getBotConfig, updateBotConfig, getGuildConfig, updateGuildConfig } from './firebase.ts';
-import { checkCashAppPayment } from './cashapp.ts';
-import { checkEmailPayment, testPaymentEmail, inspectLatestPaymentEmail } from './email-payments.ts';
-import { testZelleConnection } from './zelle.ts';
 
 dotenv.config();
-
-// --- UI Helpers ---
-function makeSelect(customId: string, placeholder: string, options: { label: string; value: string }[], extra?: { min?: number; max?: number }) {
-  const s = new StringSelectMenuBuilder().setCustomId(customId).setPlaceholder(placeholder).addOptions(options);
-  if (extra?.min !== undefined) s.setMinValues(extra.min);
-  if (extra?.max !== undefined) s.setMaxValues(extra.max);
-  return new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(s);
-}
-
-function makeInput(customId: string, label: string, style: TextInputStyle, opts: { value?: string; placeholder?: string; required?: boolean } = {}) {
-  const i = new TextInputBuilder().setCustomId(customId).setLabel(label).setStyle(style);
-  if (opts.value !== undefined) i.setValue(opts.value);
-  if (opts.placeholder !== undefined) i.setPlaceholder(opts.placeholder);
-  if (opts.required !== undefined) i.setRequired(opts.required);
-  return new ActionRowBuilder<ModalActionRowComponentBuilder>().addComponents(i);
-}
-
-function applyReplacements(template: string, map: Record<string, string>) {
-  return Object.entries(map).reduce((s, [k, v]) => s.replace(new RegExp(`\\{${k}\\}`, 'g'), v), template);
-}
-
-const ORDER_STATUS_OPTIONS = [
-  { label: '🕐 Pending', value: 'pending' },
-  { label: '💸 Pending Cash App', value: 'pending_cashapp' },
-  { label: '🔵 Pending Venmo', value: 'pending_venmo' },
-  { label: '🟣 Pending Zelle', value: 'pending_zelle' },
-  { label: '🅿️ Pending PayPal', value: 'pending_paypal' },
-  { label: '🪙 Pending Crypto', value: 'pending_crypto' },
-  { label: '✅ Paid', value: 'paid' },
-  { label: '🎉 Fulfilled', value: 'paid_fulfilled' },
-];
-
-const CONFIRM_ALL_STATUS_MAP: Record<string, { status: string; name: string }> = {
-  admin_confirm_all_cashapp:  { status: 'pending_cashapp', name: 'Cash App ' },
-  admin_confirm_all_venmo:    { status: 'pending_venmo',   name: 'Venmo ' },
-  admin_confirm_all_zelle:    { status: 'pending_zelle',   name: 'Zelle ' },
-  admin_confirm_all_paypal:   { status: 'pending_paypal',  name: 'PayPal ' },
-  admin_confirm_all_crypto:   { status: 'pending_crypto',  name: 'Crypto ' },
-  admin_confirm_all_pending:  { status: 'pending',         name: 'pending ' },
-};
 
 // --- Input Sanitization ---
 // Strips Discord markdown/mention exploits and enforces length limits.
@@ -111,21 +63,20 @@ function createEmbed(config: any) {
   } else {
     embed.setColor(0xFF6321);
   }
-
-  const displayName = config?.botDisplayName || 'Burrito.exe';
-  const avatarUrl = client.user?.displayAvatarURL({ size: 64 });
-  embed.setAuthor({ name: displayName, ...(avatarUrl ? { iconURL: avatarUrl } : {}) });
-
+  
+  if (config?.botDisplayName) {
+    embed.setAuthor({ name: config.botDisplayName });
+  }
+  
   if (config?.footerText) {
     embed.setFooter({ text: config.footerText });
   }
-
+  
   return embed;
 }
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-const LOGO_PATH = path.join(__dirname, 'public', 'logo.png');
 
 // Initialize Discord Client and State
 const client = new Client({
@@ -135,7 +86,7 @@ const client = new Client({
   ]
 });
 const orderState = new Map<string, any>();
-const pendingFoodieOrders = new Map<string, { customers: any[]; config: any; createdAt?: number }>(); // userId:guildId → pending foodie parse
+const pendingFoodieOrders = new Map<string, { customers: any[]; config: any }>(); // userId:guildId → pending foodie parse
 
 const QUEUE_SCHEDULE_TEXT = `📋 **How Our Queue Works**
 The queue opens **2 hours before** each placement time. Once the queue opens, submit your order at any point before the placement deadline. Your pickup time must be at least **45 minutes after** the placement time.
@@ -162,23 +113,14 @@ The queue opens **2 hours before** each placement time. Once the queue opens, su
 • If you open a ticket even **1 minute after** the placement time, you will be placed on the **next batch** — no exceptions.
 • Once an order is submitted, it **cannot be edited**.
 • Late submissions disrupt the flow for everyone.`;
-const cashappPollers = new Map<string, { interval: ReturnType<typeof setInterval>, timeout: ReturnType<typeof setTimeout> }>();
-// zellePollers removed — Zelle uses emailPaymentPollers
-const emailPaymentPollers = new Map<string, { interval: ReturnType<typeof setInterval>, timeout: ReturnType<typeof setTimeout> }>();
-const depositPollers = new Map<string, { interval: ReturnType<typeof setInterval>, timeout: ReturnType<typeof setTimeout> }>();
-// Track email UIDs already used so the same notification can't confirm two orders
-const emailUsedUids  = new Set<string>();
-// Cleanup stale orders and pending foodie orders every hour to prevent memory leaks
+const stripePollers = new Map<string, { interval: ReturnType<typeof setInterval>, timeout: ReturnType<typeof setTimeout> }>();
+
+// Cleanup stale orders every hour to prevent memory leaks
 setInterval(() => {
   const now = Date.now();
   for (const [key, state] of orderState.entries()) {
-    if (state.lastUpdated && now - state.lastUpdated > 3600000) {
+    if (state.lastUpdated && now - state.lastUpdated > 3600000) { // 1 hour
       orderState.delete(key);
-    }
-  }
-  for (const [key, entry] of pendingFoodieOrders.entries()) {
-    if (entry.createdAt && now - entry.createdAt > 3600000) {
-      pendingFoodieOrders.delete(key);
     }
   }
 }, 3600000);
@@ -207,8 +149,6 @@ function generateShortOrderId() {
   let id = '';
   for (let i = 0; i < 3; i++) id += letters.charAt(Math.floor(Math.random() * letters.length));
   for (let i = 0; i < 3; i++) id += numbers.charAt(Math.floor(Math.random() * numbers.length));
-  // Append timestamp suffix to prevent collisions under high load
-  id += Date.now().toString(36).slice(-2).toUpperCase();
   return id;
 }
 
@@ -216,14 +156,13 @@ function formatConfirmedOrderPayload(userId: string, userInfo: any, parsedOrders
   const headerFmt = config?.orderHeaderFormat || `Customer: {discord}\nPickup Location: {location}\nPickup Time: {time}\nPhone: {phone}\nEmail: {email}`;
   const itemFmt = config?.orderItemFormat || `Order {#}\n{name}\n{entree}\n{protein}\n{rice}\n{beans}\n{toppings}\n{premium}`;
 
-  const header = applyReplacements(headerFmt, {
-    discord: `<@${userId}>`,
-    name: userInfo.name || 'N/A',
-    location: userInfo.location || 'N/A',
-    time: userInfo.time || 'N/A',
-    phone: userInfo.phone || 'N/A',
-    email: userInfo.email || 'N/A',
-  });
+  const header = headerFmt
+    .replace(/{discord}/g, `<@${userId}>`)
+    .replace(/{name}/g, userInfo.name || 'N/A')
+    .replace(/{location}/g, userInfo.location || 'N/A')
+    .replace(/{time}/g, userInfo.time || 'N/A')
+    .replace(/{phone}/g, userInfo.phone || 'N/A')
+    .replace(/{email}/g, userInfo.email || 'N/A');
 
   const ordersStr = parsedOrders.map((order: any, index: number) => {
     const proteinStr = order.isDouble
@@ -239,17 +178,16 @@ function formatConfirmedOrderPayload(userId: string, userInfo: any, parsedOrders
 
     const premiumStr = order.premiums && order.premiums.length > 0 ? order.premiums.join('\n') : '';
 
-    return applyReplacements(itemFmt, {
-      '#': String(index + 1),
-      name: userInfo.name || 'N/A',
-      entreeName: order.entreeName || userInfo.name || 'N/A',
-      entree: order.type,
-      protein: proteinStr,
-      rice: riceStr,
-      beans: beansStr,
-      toppings: toppingsList,
-      premium: premiumStr,
-    }).split('\n').filter((line: string) => line.trim() !== '').join('\n');
+    return itemFmt
+      .replace(/{#}/g, String(index + 1))
+      .replace(/{name}/g, userInfo.name || 'N/A')
+      .replace(/{entree}/g, order.type)
+      .replace(/{protein}/g, proteinStr)
+      .replace(/{rice}/g, riceStr)
+      .replace(/{beans}/g, beansStr)
+      .replace(/{toppings}/g, toppingsList)
+      .replace(/{premium}/g, premiumStr)
+      .split('\n').filter((line: string) => line.trim() !== '').join('\n');
   }).join('\n\n');
 
   return `${header}\n\n${ordersStr}`;
@@ -274,8 +212,7 @@ function formatOrderItems(parsedOrders: any[]) {
       ? `${order.beans.portion} ${order.beans.type}` 
       : `${order.beans.type}`;
 
-    const nameLabel = order.entreeName ? ` — ${order.entreeName}` : '';
-    return `Order ${index + 1}${nameLabel}\n${order.type}\n${proteinStr}\n${riceStr}\n${beansStr}\n${toppingLines}`;
+    return `Order ${index + 1}\n${order.type}\n${proteinStr}\n${riceStr}\n${beansStr}\n${toppingLines}`;
   }).join('\n\n');
 }
 
@@ -285,6 +222,26 @@ const commands = [
     .setName('order')
     .setDescription('Start a new Chipotle order')
     .setDefaultMemberPermissions(null),
+  new SlashCommandBuilder()
+    .setName('config')
+    .setDescription('Configure bot messages (Admin only)'),
+  new SlashCommandBuilder()
+    .setName('cashapp')
+    .setDescription('Configure Cash App tag (Admin only)')
+    .addStringOption(option =>
+      option.setName('cashtag')
+        .setDescription('Your $cashtag (e.g., $JohnDoe)')
+        .setRequired(true)
+    ),
+  new SlashCommandBuilder()
+    .setName('pending')
+    .setDescription('View all pending orders and confirm them (Admin only)'),
+  new SlashCommandBuilder()
+    .setName('admin_orders')
+    .setDescription('View and manage orders (Admin only)'),
+  new SlashCommandBuilder()
+    .setName('admin_batch')
+    .setDescription('View and clear the current order batch (Admin only)'),
   new SlashCommandBuilder()
     .setName('reorder')
     .setDescription('Repeat your last order with one click')
@@ -298,13 +255,6 @@ const commands = [
     .setDescription('Check your credit balance')
     .setDefaultMemberPermissions(null),
   new SlashCommandBuilder()
-    .setName('deposit')
-    .setDescription('Add funds to your wallet using Cash App, Venmo, Zelle, or PayPal')
-    .setDefaultMemberPermissions(null)
-    .addNumberOption(opt =>
-      opt.setName('amount').setDescription('Amount to deposit (e.g. 20.00)').setRequired(true).setMinValue(1).setMaxValue(500)
-    ),
-  new SlashCommandBuilder()
     .setName('support')
     .setDescription('Open a support ticket in the server')
     .setDefaultMemberPermissions(null),
@@ -313,207 +263,14 @@ const commands = [
     .setDescription('Shows how the bot works')
     .setDefaultMemberPermissions(null),
   new SlashCommandBuilder()
-    .setName('menu')
-    .setDescription('View the current menu and options')
-    .setDefaultMemberPermissions(null),
-  new SlashCommandBuilder()
-    .setName('schedule')
-    .setDescription('View queue times, pickup rules, and how ordering works')
-    .setDefaultMemberPermissions(null),
-  new SlashCommandBuilder()
-    .setName('manualorder')
-    .setDescription('Create an order and print it in confirmed-order format — no payment required')
-    .setDefaultMemberPermissions(null),
-  // /orders — merged: orders (view), admin_orders (manage), admin_batch (batch), pending (pending)
+    .setName('revenue')
+    .setDescription('Detailed revenue report (daily/weekly/monthly) (Admin only)'),
   new SlashCommandBuilder()
     .setName('orders')
-    .setDescription('Order queue management (Admin/Staff)')
-    .addSubcommand(sub =>
-      sub.setName('view')
-        .setDescription('View all queued orders from your customers')
-    )
-    .addSubcommand(sub =>
-      sub.setName('manage')
-        .setDescription('View and manage orders (Admin only)')
-    )
-    .addSubcommand(sub =>
-      sub.setName('batch')
-        .setDescription('View and clear the current order batch (Admin only)')
-    )
-    .addSubcommand(sub =>
-      sub.setName('pending')
-        .setDescription('View all pending orders and confirm them (Admin only)')
-    ),
-  // /payment — merged: cashapp, zelle, paymentemail (setup/test/clear), verifypayment
+    .setDescription('View all queued orders from your customers (Admin only)'),
   new SlashCommandBuilder()
-    .setName('payment')
-    .setDescription('Payment provider setup and verification (Admin only)')
-    .addSubcommand(sub =>
-      sub.setName('cashapp')
-        .setDescription('Configure Cash App settings for this server')
-    )
-    .addSubcommand(sub =>
-      sub.setName('zelle')
-        .setDescription('Configure Zelle auto-verification for this server')
-    )
-    .addSubcommand(sub =>
-      sub.setName('setup')
-        .setDescription('Set up shared email inbox for automatic payment verification (private modal)')
-    )
-    .addSubcommand(sub =>
-      sub.setName('test')
-        .setDescription('Test the saved payment email credentials')
-    )
-    .addSubcommand(sub =>
-      sub.setName('clear')
-        .setDescription('Remove saved payment email credentials')
-    )
-    .addSubcommand(sub =>
-      sub.setName('verify')
-        .setDescription('Scan inbox for a recent payment and show what was read')
-        .addStringOption(o =>
-          o.setName('provider')
-            .setDescription('Payment provider to look for')
-            .setRequired(true)
-            .addChoices(
-              { name: 'Cash App', value: 'cashapp' },
-              { name: 'Venmo',    value: 'venmo'   },
-              { name: 'Zelle',    value: 'zelle'   },
-              { name: 'PayPal',   value: 'paypal'  },
-            )
-        )
-        .addNumberOption(o =>
-          o.setName('amount').setDescription('Expected payment amount (e.g. 12.50)').setRequired(true)
-        )
-        .addStringOption(o =>
-          o.setName('order_id').setDescription('Order ID to match against memo').setRequired(false)
-        )
-        .addIntegerOption(o =>
-          o.setName('lookback').setDescription('How many minutes back to search (default 45)').setRequired(false)
-        )
-    ),
-  // /setup — merged: config, settings, admin_setup
-  new SlashCommandBuilder()
-    .setName('setup')
-    .setDescription('Bot configuration and server setup (Admin only)')
-    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
-    .addSubcommand(sub =>
-      sub.setName('config')
-        .setDescription('Configure bot messages')
-    )
-    .addSubcommand(sub =>
-      sub.setName('settings')
-        .setDescription('Quick panel to reconfigure everything at once')
-    )
-    .addSubcommand(sub =>
-      sub.setName('main')
-        .setDescription('Configure the bot for your server — webhooks, payments, and more')
-    ),
-  // /report — merged: revenue, history, stats, customers, export
-  new SlashCommandBuilder()
-    .setName('report')
-    .setDescription('Reports and analytics (Admin only)')
-    .addSubcommand(sub =>
-      sub.setName('revenue')
-        .setDescription('Detailed revenue report (daily/weekly/monthly)')
-    )
-    .addSubcommand(sub =>
-      sub.setName('history')
-        .setDescription('Past order history with results')
-    )
-    .addSubcommand(sub =>
-      sub.setName('stats')
-        .setDescription("Today's order snapshot — count, revenue, avg size, top items")
-    )
-    .addSubcommand(sub =>
-      sub.setName('customers')
-        .setDescription('See your top customers by order count')
-    )
-    .addSubcommand(sub =>
-      sub.setName('export')
-        .setDescription('Export all orders to a CSV file')
-    ),
-  // /round — merged: pause, roundsummary, exportround
-  new SlashCommandBuilder()
-    .setName('round')
-    .setDescription('Queue round management (Admin only)')
-    .addSubcommand(sub =>
-      sub.setName('pause')
-        .setDescription('Pause or resume a queue round')
-        .addStringOption(option =>
-          option.setName('round')
-            .setDescription('Which round to pause/resume')
-            .setRequired(true)
-            .addChoices(
-              { name: 'Round 1 (8:45 AM PST)', value: '1' },
-              { name: 'Round 2 (11:45 AM PST)', value: '2' },
-              { name: 'Round 3 (2:45 PM PST)', value: '3' },
-              { name: 'Round 4 (4:45 PM PST)', value: '4' },
-              { name: 'All Rounds', value: 'all' },
-            )
-        )
-        .addStringOption(option =>
-          option.setName('action')
-            .setDescription('Pause or resume')
-            .setRequired(true)
-            .addChoices(
-              { name: '⏸️ Pause', value: 'pause' },
-              { name: '▶️ Resume', value: 'resume' },
-            )
-        )
-    )
-    .addSubcommand(sub =>
-      sub.setName('summary')
-        .setDescription("Show a full breakdown of today's orders for a given round")
-        .addIntegerOption(option =>
-          option.setName('round').setDescription('Round number').setRequired(true)
-            .addChoices(
-              { name: 'Round 1 — Placement 8:45 AM', value: 1 },
-              { name: 'Round 2 — Placement 11:45 AM', value: 2 },
-              { name: 'Round 3 — Placement 2:45 PM',  value: 3 },
-              { name: 'Round 4 — Placement 4:45 PM',  value: 4 },
-            )
-        )
-    )
-    .addSubcommand(sub =>
-      sub.setName('export')
-        .setDescription("Export one round's orders to a CSV file")
-        .addIntegerOption(option =>
-          option.setName('round').setDescription('Round number').setRequired(true)
-            .addChoices(
-              { name: 'Round 1 — Placement 8:45 AM', value: 1 },
-              { name: 'Round 2 — Placement 11:45 AM', value: 2 },
-              { name: 'Round 3 — Placement 2:45 PM',  value: 3 },
-              { name: 'Round 4 — Placement 4:45 PM',  value: 4 },
-            )
-        )
-    ),
-  // /branding — merged: branding (customize), setnickname, renamechannel
-  new SlashCommandBuilder()
-    .setName('branding')
-    .setDescription('Branding and display customization (Admin only)')
-    .addSubcommand(sub =>
-      sub.setName('customize')
-        .setDescription('Change embed color, bot name, footer text')
-    )
-    .addSubcommand(sub =>
-      sub.setName('nickname')
-        .setDescription("Change the bot's display name in your server")
-        .addStringOption(option => option.setName('nickname').setDescription('New nickname').setRequired(true))
-    )
-    .addSubcommand(sub =>
-      sub.setName('channel')
-        .setDescription('Rename the status channel to open or closed')
-        .addStringOption(option =>
-          option.setName('status')
-            .setDescription('Set the channel name to open or closed')
-            .setRequired(true)
-            .addChoices(
-              { name: '🟢 Open', value: 'open' },
-              { name: '🔴 Closed', value: 'closed' }
-            )
-        )
-    ),
+    .setName('history')
+    .setDescription('Past order history with results (Admin only)'),
   new SlashCommandBuilder()
     .setName('setprice')
     .setDescription('Change what your customers pay per entree (Admin only)')
@@ -524,8 +281,14 @@ const commands = [
     .setName('setpayment')
     .setDescription('Update your payment methods (Venmo, Zelle, etc.) (Admin only)'),
   new SlashCommandBuilder()
+    .setName('branding')
+    .setDescription('Change embed color, bot name, footer text (Admin only)'),
+  new SlashCommandBuilder()
     .setName('toggle')
     .setDescription('Enable or disable ordering in your server (Admin only)'),
+  new SlashCommandBuilder()
+    .setName('settings')
+    .setDescription('Quick panel to reconfigure everything at once (Admin only)'),
   new SlashCommandBuilder()
     .setName('forceconfirm')
     .setDescription('Manually confirm a payment if auto-detect missed it (Admin only)')
@@ -538,6 +301,16 @@ const commands = [
     .setName('blacklist')
     .setDescription('Block or unblock a customer (Admin only)')
     .addUserOption(option => option.setName('user').setDescription('User to block/unblock').setRequired(true)),
+  new SlashCommandBuilder()
+    .setName('customers')
+    .setDescription('See your top customers by order count (Admin only)'),
+  new SlashCommandBuilder()
+    .setName('setnickname')
+    .setDescription('Change the bot\'s display name in your server (Admin only)')
+    .addStringOption(option => option.setName('nickname').setDescription('New nickname').setRequired(true)),
+  new SlashCommandBuilder()
+    .setName('admin_setup')
+    .setDescription('Configure the bot for your server — Stripe, webhooks, payments, and more (Admin only)'),
   new SlashCommandBuilder()
     .setName('announcements')
     .setDescription('Create a new announcement in a channel or via webhook (Admin only)')
@@ -553,8 +326,35 @@ const commands = [
     .setName('storestatus')
     .setDescription('Open or close the store for new orders (Admin only)'),
   new SlashCommandBuilder()
+    .setName('renamechannel')
+    .setDescription('Rename the status channel to open or closed (Admin only)')
+    .addStringOption(option =>
+      option.setName('status')
+        .setDescription('Set the channel name to open or closed')
+        .setRequired(true)
+        .addChoices(
+          { name: '🟢 Open', value: 'open' },
+          { name: '🔴 Closed', value: 'closed' }
+        )
+    ),
+  new SlashCommandBuilder()
+    .setName('export')
+    .setDescription('Export all orders to a CSV file (Admin only)'),
+  new SlashCommandBuilder()
+    .setName('status')
+    .setDescription('Check the status of your recent orders')
+    .setDefaultMemberPermissions(null),
+  new SlashCommandBuilder()
+    .setName('menu')
+    .setDescription('View the current menu and options')
+    .setDefaultMemberPermissions(null),
+  new SlashCommandBuilder()
     .setName('format')
     .setDescription('Customize the order details format printed after payment confirmation (Admin only)'),
+  new SlashCommandBuilder()
+    .setName('schedule')
+    .setDescription('View queue times, pickup rules, and how ordering works')
+    .setDefaultMemberPermissions(null),
   new SlashCommandBuilder()
     .setName('setwebhook')
     .setDescription('Set the webhook URL and status channel for this server (Admin only)')
@@ -578,10 +378,40 @@ const commands = [
     .addNumberOption(option => option.setName('amount').setDescription('Amount to add (use negative to subtract)').setRequired(true))
     .addStringOption(option => option.setName('reason').setDescription('Reason for credit adjustment').setRequired(false)),
   new SlashCommandBuilder()
+    .setName('pause')
+    .setDescription('Pause or resume a queue round (Admin only)')
+    .addStringOption(option =>
+      option.setName('round')
+        .setDescription('Which round to pause/resume')
+        .setRequired(true)
+        .addChoices(
+          { name: 'Round 1 (8:45 AM PST)', value: '1' },
+          { name: 'Round 2 (11:45 AM PST)', value: '2' },
+          { name: 'Round 3 (2:45 PM PST)', value: '3' },
+          { name: 'Round 4 (4:45 PM PST)', value: '4' },
+          { name: 'All Rounds', value: 'all' },
+        )
+    )
+    .addStringOption(option =>
+      option.setName('action')
+        .setDescription('Pause or resume')
+        .setRequired(true)
+        .addChoices(
+          { name: '⏸️ Pause', value: 'pause' },
+          { name: '▶️ Resume', value: 'resume' },
+        )
+    ),
+  new SlashCommandBuilder()
     .setName('dm')
     .setDescription('Send a direct message to a customer (Admin only)')
     .addUserOption(option => option.setName('user').setDescription('Customer to message').setRequired(true))
     .addStringOption(option => option.setName('message').setDescription('Message to send').setRequired(true)),
+  new SlashCommandBuilder()
+    .setName('stats')
+    .setDescription("Today's order snapshot — count, revenue, avg size, top items (Admin only)"),
+  new SlashCommandBuilder()
+    .setName('hours')
+    .setDescription("View today's queue schedule and which rounds are open or closed"),
   new SlashCommandBuilder()
     .setName('formatorderfoodie')
     .setDescription('Parse a .txt order file and format it as a confirmed order (Admin only)')
@@ -596,8 +426,32 @@ const commands = [
         .setRequired(false)
     ),
   new SlashCommandBuilder()
-    .setName('hours')
-    .setDescription("View today's queue schedule and which rounds are open, closed, or paused"),
+    .setName('manualorder')
+    .setDescription('Create an order for a customer and print it in confirmed-order format — no payment (Admin only)'),
+  new SlashCommandBuilder()
+    .setName('roundsummary')
+    .setDescription("Show a full breakdown of today's orders for a given round (Admin only)")
+    .addIntegerOption(option =>
+      option.setName('round').setDescription('Round number').setRequired(true)
+        .addChoices(
+          { name: 'Round 1 — Placement 8:45 AM', value: 1 },
+          { name: 'Round 2 — Placement 11:45 AM', value: 2 },
+          { name: 'Round 3 — Placement 2:45 PM',  value: 3 },
+          { name: 'Round 4 — Placement 4:45 PM',  value: 4 },
+        )
+    ),
+  new SlashCommandBuilder()
+    .setName('exportround')
+    .setDescription("Export one round's orders to a CSV file (Admin only)")
+    .addIntegerOption(option =>
+      option.setName('round').setDescription('Round number').setRequired(true)
+        .addChoices(
+          { name: 'Round 1 — Placement 8:45 AM', value: 1 },
+          { name: 'Round 2 — Placement 11:45 AM', value: 2 },
+          { name: 'Round 3 — Placement 2:45 PM',  value: 3 },
+          { name: 'Round 4 — Placement 4:45 PM',  value: 4 },
+        )
+    ),
 ].map(command => command.toJSON());
 
 // Handle global errors to prevent silent crashes
@@ -608,6 +462,23 @@ process.on('uncaughtException', (err) => {
 process.on('unhandledRejection', (reason, promise) => {
   console.error('Unhandled Rejection at:', promise, 'reason:', reason);
 });
+
+// Per-guild Stripe client cache, keyed by guildId
+const guildStripeClients = new Map<string, Stripe>();
+
+async function getStripeForGuild(guildId: string): Promise<Stripe | null> {
+  if (guildStripeClients.has(guildId)) return guildStripeClients.get(guildId)!;
+  const config = await getGuildConfig(guildId) || {};
+  const key = config.stripeSecretKey;
+  if (!key) {
+    console.warn(`⚠️ No Stripe secret key configured for guild ${guildId}. Admin must run /admin_setup.`);
+    return null;
+  }
+  const client = new Stripe(key, { apiVersion: '2026-02-25.clover' });
+  guildStripeClients.set(guildId, client);
+  return client;
+}
+
 
 // Returns the PST UTC offset in minutes (e.g. -480 for PST, -420 for PDT)
 function getPSTUtcOffsetMinutes(): number {
@@ -750,8 +621,9 @@ async function showPickupTimeSelect(interaction: any, state: any) {
     }
   }
 
+  const earliestMinutes = getEarliestPickupMinutesPST();
+
   const userTimezone: string = state.info?.timezone || 'America/Los_Angeles';
-  const earliestMinutes = state.isManual ? 11 * 60 : getEarliestPickupMinutesPST();
 
   const options = generatePickupTimeOptions(earliestMinutes, userTimezone);
   const earliestStr = options[0]?.label ?? pstTimeToLocalLabel(Math.floor(earliestMinutes / 60), earliestMinutes % 60, userTimezone);
@@ -766,19 +638,20 @@ async function showPickupTimeSelect(interaction: any, state: any) {
         .addOptions(options)
     ));
   } else {
-    // Split into 25-option chunks (Discord max per select menu)
-    const chunks: typeof options[] = [];
-    for (let i = 0; i < options.length; i += 25) {
-      chunks.push(options.slice(i, i + 25));
-    }
-    chunks.forEach((chunk, idx) => {
-      rows.push(new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(
-        new StringSelectMenuBuilder()
-          .setCustomId(`pickup_time_select_${idx + 1}`)
-          .setPlaceholder(`🕐 ${chunk[0]?.label} — ${chunk[chunk.length - 1]?.label}`)
-          .addOptions(chunk)
-      ));
-    });
+    const first = options.slice(0, 25);
+    const second = options.slice(25);
+    rows.push(new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(
+      new StringSelectMenuBuilder()
+        .setCustomId('pickup_time_select_1')
+        .setPlaceholder(`🕐 ${first[0].label} — ${first[24].label}`)
+        .addOptions(first)
+    ));
+    rows.push(new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(
+      new StringSelectMenuBuilder()
+        .setCustomId('pickup_time_select_2')
+        .setPlaceholder(`🕐 ${second[0].label} — ${second[second.length - 1].label}`)
+        .addOptions(second)
+    ));
   }
 
   await interaction.editReply({
@@ -821,7 +694,7 @@ async function showOrderModal(interaction: any) {
 
   const entreesInput = new TextInputBuilder()
     .setCustomId('entrees')
-    .setLabel('Number of Entrees (1–8)')
+    .setLabel('Number of Entrees (1–9)')
     .setStyle(TextInputStyle.Short)
     .setPlaceholder('e.g. 2')
     .setRequired(true);
@@ -853,81 +726,11 @@ async function initDiscordBot() {
     console.log('Successfully reloaded application (/) commands.');
 
     client.once(Events.ClientReady, async c => {
+      console.log(`✅ Ready! Logged in as ${c.user.tag}`);
       const config = await getBotConfig() || {};
       if (config.statusMessage) {
         c.user.setActivity(config.statusMessage);
       }
-
-      // Set bot avatar from logo file (only if not already set via branding config)
-      if (!config.avatarUrl && fs.existsSync(LOGO_PATH)) {
-        try {
-          await c.user.setAvatar(fs.readFileSync(LOGO_PATH));
-          console.log('✅ Bot avatar set from logo.png');
-        } catch (e: any) {
-          // Rate limit is 2 avatar changes per hour — silently skip if limited
-          console.warn('⚠️  Could not set bot avatar:', e.message);
-        }
-      }
-      const guildCount = c.guilds.cache.size;
-      const now = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
-      const tag = c.user.tag;
-      const id  = c.user.id;
-      // ── Matrix-style boot banner ──────────────────────────────────────────
-      const G  = '\x1b[32m';    // matrix green
-      const BG = '\x1b[92m';    // bright green
-      const DG = '\x1b[2;32m';  // dim green
-      const WH = '\x1b[97m';    // white
-      const DW = '\x1b[2;37m';  // dim white
-      const R  = '\x1b[0m';     // reset
-      const B  = '\x1b[1m';     // bold
-
-      const logo = [
-        `${BG} ██████╗ ██╗   ██╗██████╗ ██████╗ ██╗████████╗ ██████╗ ${R}`,
-        `${BG} ██╔══██╗██║   ██║██╔══██╗██╔══██╗██║╚══██╔══╝██╔═══██╗${R}`,
-        `${G}  ██████╔╝██║   ██║██████╔╝██████╔╝██║   ██║   ██║   ██║${R}`,
-        `${G}  ██╔══██╗██║   ██║██╔══██╗██╔══██╗██║   ██║   ██║   ██║${R}`,
-        `${DG} ██████╔╝╚██████╔╝██║  ██║██║  ██║██║   ██║   ╚██████╔╝${R}`,
-        `${DG} ╚═════╝  ╚═════╝ ╚═╝  ╚═╝╚═╝  ╚═╝╚═╝   ╚═╝    ╚═════╝ ${R}`,
-        `${DG}                                                           ${R}`,
-        `${DG}  ██████╗  ██████╗ ████████╗                              ${R}`,
-        `${G}  ██╔══██╗██╔═══██╗╚══██╔══╝                              ${R}`,
-        `${G}  ██████╔╝██║   ██║   ██║                                 ${R}`,
-        `${BG} ██╔══██╗██║   ██║   ██║                                 ${R}`,
-        `${BG} ██████╔╝╚██████╔╝   ██║                                 ${R}`,
-        `${BG} ╚═════╝  ╚═════╝    ╚═╝                                 ${R}`,
-      ];
-
-      // randomised matrix rain header
-      const rainChars = '01アイウエオカキクケコサシスセソタチツテトナニヌネノ';
-      const rainLine = (len: number) =>
-        Array.from({ length: len }, () =>
-          Math.random() > 0.6
-            ? `${BG}${rainChars[Math.floor(Math.random() * rainChars.length)]}${R}`
-            : `${DG}${rainChars[Math.floor(Math.random() * rainChars.length)]}${R}`
-        ).join('');
-
-      const w = 56;
-      const bar   = `${DG}${'─'.repeat(w)}${R}`;
-      const field = (label: string, val: string) =>
-        `  ${DG}${label.padEnd(10)}${R}${G}${val}${R}`;
-
-      console.log('');
-      console.log(`  ${DG}${rainLine(w)}${R}`);
-      console.log(`  ${DG}${rainLine(w)}${R}`);
-      console.log('');
-      logo.forEach(l => console.log(` ${l}`));
-      console.log('');
-      console.log(`  ${bar}`);
-      console.log(field('TAG',      tag));
-      console.log(field('ID',       id));
-      console.log(field('SERVERS',  String(guildCount)));
-      console.log(field('UPLINK',   now));
-      console.log(field('STATUS',   config.statusMessage || 'NOMINAL'));
-      console.log(field('DASH',     `http://localhost:${process.env.PORT || 3000}`));
-      console.log(`  ${bar}`);
-      console.log(`  ${BG}${B}  [ SYSTEM ONLINE — AWAITING ORDERS ]${R}`);
-      console.log(`  ${DG}${rainLine(w)}${R}`);
-      console.log('');
     });
 
     // Register Interaction Handler
@@ -940,6 +743,10 @@ async function initDiscordBot() {
               .setTitle('🗓️ Queue Schedule & Rules')
               .setDescription(QUEUE_SCHEDULE_TEXT);
             return await interaction.reply({ embeds: [embed], flags: MessageFlags.Ephemeral });
+          }
+
+          if (interaction.commandName === 'hours') {
+            return await handleHours(interaction);
           }
 
           if (interaction.commandName === 'order') {
@@ -979,75 +786,82 @@ async function initDiscordBot() {
 
           // (order modal is shown via start_order_modal button — see button handler below)
 
-          if (interaction.commandName === 'setup') {
+          if (interaction.commandName === 'config') {
             if (!interaction.memberPermissions?.has('Administrator')) {
               return await interaction.reply({ content: '❌ You do not have permission to use this command.', flags: MessageFlags.Ephemeral });
             }
-            const setupSub = (interaction.options as any).getSubcommand();
 
-            if (setupSub === 'config') {
-              const config = await getGuildConfig(interaction.guildId!) || {};
+            const config = await getGuildConfig(interaction.guildId!) || {};
 
-              const modal = new ModalBuilder()
-                .setCustomId('config_modal')
-                .setTitle('Bot Message Configuration');
+            const modal = new ModalBuilder()
+              .setCustomId('config_modal')
+              .setTitle('Bot Message Configuration');
+            
+            const welcomeInput = new TextInputBuilder()
+              .setCustomId('welcomeMessage')
+              .setLabel('Welcome Message')
+              .setStyle(TextInputStyle.Paragraph)
+              .setValue(config.welcomeMessage || 'Great! Now choose your entree:')
+              .setRequired(false);
 
-              const welcomeInput = new TextInputBuilder()
-                .setCustomId('welcomeMessage')
-                .setLabel('Welcome Message')
-                .setStyle(TextInputStyle.Paragraph)
-                .setValue(config.welcomeMessage || 'Great! Now choose your entree:')
-                .setRequired(false);
+            const entreeInput = new TextInputBuilder()
+              .setCustomId('entreePrompt')
+              .setLabel('Entree Selection Prompt')
+              .setStyle(TextInputStyle.Short)
+              .setValue(config.entreePrompt || 'Choose your entree:')
+              .setRequired(false);
 
-              const entreeInput = new TextInputBuilder()
-                .setCustomId('entreePrompt')
-                .setLabel('Entree Selection Prompt')
-                .setStyle(TextInputStyle.Short)
-                .setValue(config.entreePrompt || 'Choose your entree:')
-                .setRequired(false);
+            const proteinInput = new TextInputBuilder()
+              .setCustomId('proteinPrompt')
+              .setLabel('Protein Selection Prompt')
+              .setStyle(TextInputStyle.Short)
+              .setValue(config.proteinPrompt || 'Now choose your protein:')
+              .setRequired(false);
 
-              const proteinInput = new TextInputBuilder()
-                .setCustomId('proteinPrompt')
-                .setLabel('Protein Selection Prompt')
-                .setStyle(TextInputStyle.Short)
-                .setValue(config.proteinPrompt || 'Now choose your protein:')
-                .setRequired(false);
+            const checkoutInput = new TextInputBuilder()
+              .setCustomId('checkoutMessage')
+              .setLabel('Checkout Instructions')
+              .setStyle(TextInputStyle.Paragraph)
+              .setValue(config.checkoutMessage || 'Please pay using the link below. Your order will be sent to the kitchen automatically once payment is confirmed.')
+              .setRequired(false);
 
-              const checkoutInput = new TextInputBuilder()
-                .setCustomId('checkoutMessage')
-                .setLabel('Checkout Instructions')
-                .setStyle(TextInputStyle.Paragraph)
-                .setValue(config.checkoutMessage || 'Please pay using the link below. Your order will be sent to the kitchen automatically once payment is confirmed.')
-                .setRequired(false);
+            const successInput = new TextInputBuilder()
+              .setCustomId('successMessage')
+              .setLabel('Success Confirmation')
+              .setStyle(TextInputStyle.Paragraph)
+              .setValue(config.successMessage || '✅ Payment confirmed! Your order has been sent to the kitchen.')
+              .setRequired(false);
 
-              const successInput = new TextInputBuilder()
-                .setCustomId('successMessage')
-                .setLabel('Success Confirmation')
-                .setStyle(TextInputStyle.Paragraph)
-                .setValue(config.successMessage || '✅ Payment confirmed! Your order has been sent to the kitchen.')
-                .setRequired(false);
+            modal.addComponents(
+              new ActionRowBuilder<ModalActionRowComponentBuilder>().addComponents(welcomeInput),
+              new ActionRowBuilder<ModalActionRowComponentBuilder>().addComponents(entreeInput),
+              new ActionRowBuilder<ModalActionRowComponentBuilder>().addComponents(proteinInput),
+              new ActionRowBuilder<ModalActionRowComponentBuilder>().addComponents(checkoutInput),
+              new ActionRowBuilder<ModalActionRowComponentBuilder>().addComponents(successInput)
+            );
 
-              modal.addComponents(
-                new ActionRowBuilder<ModalActionRowComponentBuilder>().addComponents(welcomeInput),
-                new ActionRowBuilder<ModalActionRowComponentBuilder>().addComponents(entreeInput),
-                new ActionRowBuilder<ModalActionRowComponentBuilder>().addComponents(proteinInput),
-                new ActionRowBuilder<ModalActionRowComponentBuilder>().addComponents(checkoutInput),
-                new ActionRowBuilder<ModalActionRowComponentBuilder>().addComponents(successInput)
-              );
+            await interaction.showModal(modal);
+          }
 
-              await interaction.showModal(modal);
-            } else if (setupSub === 'settings') {
-              await handleSettings(interaction);
-            } else if (setupSub === 'main') {
-              await handleSetup(interaction);
+          if (interaction.commandName === 'admin_orders') {
+            if (!interaction.memberPermissions?.has('Administrator')) {
+              return await interaction.reply({ content: '❌ You do not have permission to use this command.', flags: MessageFlags.Ephemeral });
             }
+            await showAdminOrders(interaction, 'pending');
+          }
+
+          if (interaction.commandName === 'admin_batch') {
+            if (!interaction.memberPermissions?.has('Administrator')) {
+              return await interaction.reply({ content: '❌ You do not have permission to use this command.', flags: MessageFlags.Ephemeral });
+            }
+            await showAdminBatch(interaction);
           }
 
           if (interaction.commandName === 'reorder') {
             await handleReorder(interaction);
           }
 
-          if (interaction.commandName === 'myorders') {
+          if (interaction.commandName === 'myorders' || interaction.commandName === 'status') {
             await handleMyOrders(interaction);
           }
 
@@ -1059,10 +873,6 @@ async function initDiscordBot() {
             await handleWallet(interaction);
           }
 
-          if (interaction.commandName === 'deposit') {
-            await handleDeposit(interaction);
-          }
-
           if (interaction.commandName === 'support') {
             await handleSupport(interaction);
           }
@@ -1071,178 +881,23 @@ async function initDiscordBot() {
             await handleHelp(interaction);
           }
 
-          if (interaction.commandName === 'hours') {
-            await handleHours(interaction);
-          }
-
-          if (interaction.commandName === 'payment') {
+          if (interaction.commandName === 'cashapp') {
             if (!interaction.memberPermissions?.has('Administrator')) {
               return await interaction.reply({ content: '❌ You do not have permission to use this command.', flags: MessageFlags.Ephemeral });
             }
-            const paymentSub = (interaction.options as any).getSubcommand();
-
-            if (paymentSub === 'cashapp') {
-              // Show a prompt to guide the user to the cashapp subcommands (tag, setcookie, login are no longer top-level)
-              // For backward compat we open the Cash App tag/cookie setup menu
-              const chromePath = findChromePath();
-              const embed = createEmbed(await getGuildConfig(interaction.guildId!) || {})
-                .setTitle('Cash App Setup')
-                .setDescription([
-                  'Use the following subcommands to configure Cash App:',
-                  '• `/payment cashapp` — this help panel',
-                  '',
-                  'To set your $cashtag, use `/setpayment` or re-run with the tag option.',
-                  chromePath
-                    ? '🌐 Chrome detected — you can use the browser login flow via `/payment cashapp` (cookie capture).'
-                    : '🍪 Chrome not found — paste your `cash_web_session` cookie manually via `/payment setup`.',
-                ].join('\n'));
-              return await interaction.reply({ embeds: [embed], flags: MessageFlags.Ephemeral });
-            }
-
-            if (paymentSub === 'zelle') {
-              const config = await getGuildConfig(interaction.guildId!) || {};
-              const modal = new ModalBuilder()
-                .setCustomId('zelle_credentials_modal')
-                .setTitle('Zelle Email Credentials — This Server Only');
-              const emailInput = new TextInputBuilder()
-                .setCustomId('zelle_imap_email')
-                .setLabel('Email address (Gmail, Outlook, Yahoo…)')
-                .setStyle(TextInputStyle.Short)
-                .setRequired(true)
-                .setPlaceholder('you@gmail.com');
-              if (config.zelleImapEmail) emailInput.setValue(config.zelleImapEmail);
-              const passInput = new TextInputBuilder()
-                .setCustomId('zelle_imap_password')
-                .setLabel('App Password (not your regular password)')
-                .setStyle(TextInputStyle.Short)
-                .setRequired(true)
-                .setPlaceholder('xxxx xxxx xxxx xxxx');
-              const hostInput = new TextInputBuilder()
-                .setCustomId('zelle_imap_host')
-                .setLabel('IMAP host (leave blank to auto-detect)')
-                .setStyle(TextInputStyle.Short)
-                .setRequired(false)
-                .setPlaceholder('imap.gmail.com  /  outlook.office365.com');
-              if (config.zelleImapHost) hostInput.setValue(config.zelleImapHost);
-              modal.addComponents(
-                new ActionRowBuilder<ModalActionRowComponentBuilder>().addComponents(emailInput),
-                new ActionRowBuilder<ModalActionRowComponentBuilder>().addComponents(passInput),
-                new ActionRowBuilder<ModalActionRowComponentBuilder>().addComponents(hostInput),
-              );
-              return await interaction.showModal(modal);
-            }
-
-            if (paymentSub === 'setup') {
-              const cfg = await getGuildConfig(interaction.guildId!) || {};
-              const modal = new ModalBuilder()
-                .setCustomId('payment_email_modal')
-                .setTitle('Payment Email Setup — This Server Only');
-              const emailInput = new TextInputBuilder()
-                .setCustomId('payment_imap_email')
-                .setLabel('Email address (Gmail, Outlook, Yahoo…)')
-                .setStyle(TextInputStyle.Short).setRequired(true)
-                .setPlaceholder('you@gmail.com');
-              if (cfg.paymentImapEmail) emailInput.setValue(cfg.paymentImapEmail);
-              const passInput = new TextInputBuilder()
-                .setCustomId('payment_imap_password')
-                .setLabel('App Password (not your regular password)')
-                .setStyle(TextInputStyle.Short).setRequired(true)
-                .setPlaceholder('xxxx xxxx xxxx xxxx');
-              const hostInput = new TextInputBuilder()
-                .setCustomId('payment_imap_host')
-                .setLabel('IMAP host (leave blank to auto-detect)')
-                .setStyle(TextInputStyle.Short).setRequired(false)
-                .setPlaceholder('imap.gmail.com');
-              if (cfg.paymentImapHost) hostInput.setValue(cfg.paymentImapHost);
-              modal.addComponents(
-                new ActionRowBuilder<ModalActionRowComponentBuilder>().addComponents(emailInput),
-                new ActionRowBuilder<ModalActionRowComponentBuilder>().addComponents(passInput),
-                new ActionRowBuilder<ModalActionRowComponentBuilder>().addComponents(hostInput),
-              );
-              return await interaction.showModal(modal);
-            }
-
-            if (paymentSub === 'test') {
-              const cfg = await getGuildConfig(interaction.guildId!) || {};
-              if (!cfg.paymentImapEmail || !cfg.paymentImapPassword) {
-                return await interaction.reply({ content: '❌ No payment email saved. Run `/payment setup` first.', flags: MessageFlags.Ephemeral });
-              }
-              await interaction.reply({ content: '🔌 Testing connection…', flags: MessageFlags.Ephemeral });
-              try {
-                await testPaymentEmail({ email: cfg.paymentImapEmail, password: cfg.paymentImapPassword, host: cfg.paymentImapHost });
-                await interaction.editReply({ content: '✅ Connection successful! Email payment verification is active for Cash App, Venmo, Zelle, and PayPal.' });
-              } catch (err: any) {
-                await interaction.editReply({ content: `❌ Connection failed: ${err.message}` });
-              }
-            }
-
-            if (paymentSub === 'clear') {
-              const cfg = await getGuildConfig(interaction.guildId!) || {};
-              const updates: any = { ...cfg };
-              delete updates.paymentImapEmail;
-              delete updates.paymentImapPassword;
-              delete updates.paymentImapHost;
-              await updateGuildConfig(interaction.guildId!, updates);
-              return await interaction.reply({ content: '✅ Payment email credentials removed.', flags: MessageFlags.Ephemeral });
-            }
-
-            if (paymentSub === 'verify') {
-              const vpCfg = await getGuildConfig(interaction.guildId!) || {};
-              if (!vpCfg.paymentImapEmail || !vpCfg.paymentImapPassword) {
-                return await interaction.reply({ content: '❌ No payment email saved. Run `/payment setup` first.', flags: MessageFlags.Ephemeral });
-              }
-              const provider = (interaction.options as any).getString('provider') as import('./email-payments.ts').PaymentProvider;
-              const amount   = (interaction.options as any).getNumber('amount') as number;
-              const orderId  = (interaction.options as any).getString('order_id') as string | null;
-              const lookback = (interaction.options as any).getInteger('lookback') ?? 45;
-              await interaction.reply({ content: '🔍 Scanning inbox…', flags: MessageFlags.Ephemeral });
-              try {
-                const result = await inspectLatestPaymentEmail(
-                  { email: vpCfg.paymentImapEmail, password: vpCfg.paymentImapPassword, host: vpCfg.paymentImapHost },
-                  provider,
-                  amount,
-                  lookback,
-                );
-                if (!result) {
-                  return await interaction.editReply({ content: `❌ No matching payment email found in the last ${lookback} minutes.` });
-                }
-                const amtList  = result.amountsFound.length ? result.amountsFound.map(a => `**$${a.toFixed(2)}**`).join(', ') : '_none_';
-                const memoLine = result.memo ? `**Memo/Note:** ${result.memo}` : '**Memo/Note:** _not found_';
-
-                let verdict = result.matched ? '✅ Would be verified' : '❌ Would NOT verify';
-                let reason  = result.matchReason;
-                if (orderId && result.memo) {
-                  const memoHasId = result.memo.toLowerCase().includes(orderId.toLowerCase());
-                  reason += memoHasId ? ` | Memo contains order ID ✅` : ` | Memo does NOT contain order ID ❌`;
-                }
-                const matchLine = `**Match:** ${verdict} — ${reason}`;
-                const snippetLine = result.bodySnippet ? `**Body (first 400 chars):**\n\`\`\`\n${result.bodySnippet}\n\`\`\`` : '';
-
-                const lines = [
-                  `**Payment Verification — last ${lookback} min**`,
-                  `**UID:** \`${result.uid}\``,
-                  `**From:** ${result.from}`,
-                  `**Subject:** ${result.subject}`,
-                  `**Date:** ${result.date}`,
-                  `**Provider:** ${result.provider}`,
-                  `**Amounts Parsed:** ${amtList}`,
-                  memoLine,
-                  matchLine,
-                  snippetLine,
-                ].filter(Boolean).join('\n');
-                await interaction.editReply({ content: lines });
-              } catch (err: any) {
-                await interaction.editReply({ content: `❌ Error scanning inbox: ${err.message}` });
-              }
+            const cashtag = interaction.options.getString('cashtag');
+            const config = await getGuildConfig(interaction.guildId!) || {};
+            const newConfig = { ...config, cashappTag: cashtag };
+            const success = await updateGuildConfig(interaction.guildId!, newConfig);
+            if (success) {
+              await interaction.reply({ content: `✅ Cash App tag updated to **${cashtag}**!`, flags: MessageFlags.Ephemeral });
+            } else {
+              await interaction.reply({ content: '❌ Failed to update Cash App tag. Check server logs.', flags: MessageFlags.Ephemeral });
             }
           }
 
-          if (interaction.commandName === 'manualorder') {
-            await handleManualOrder(interaction);
-          }
-
-          const adminCommands = ['setprice', 'setpayment', 'toggle', 'blacklist', 'announcements', 'fulfillall', 'storestatus', 'format', 'setwebhook', 'test', 'credit', 'dm', 'formatorderfoodie', 'report', 'round', 'branding'];
-          const staffCommands = ['orders', 'forceconfirm', 'removeorder'];
+          const adminCommands = ['revenue', 'setprice', 'setpayment', 'branding', 'toggle', 'settings', 'blacklist', 'customers', 'setnickname', 'admin_setup', 'announcements', 'fulfillall', 'storestatus', 'renamechannel', 'export', 'pending', 'format', 'setwebhook', 'test', 'credit', 'pause', 'dm', 'stats', 'formatorderfoodie', 'roundsummary', 'exportround', 'manualorder'];
+          const staffCommands = ['orders', 'history', 'forceconfirm', 'removeorder'];
 
           if (adminCommands.includes(interaction.commandName) || staffCommands.includes(interaction.commandName)) {
             const config = await getGuildConfig(interaction.guildId!) || {};
@@ -1256,62 +911,17 @@ async function initDiscordBot() {
             if (staffCommands.includes(interaction.commandName) && !isAdmin && !isStaff) {
               return await interaction.reply({ content: '❌ You must be Staff or an Administrator to use this command.', flags: MessageFlags.Ephemeral });
             }
-
+            
             if (interaction.commandName === 'orders') {
-              const ordersSub = (interaction.options as any).getSubcommand();
-              if (ordersSub === 'view') {
-                await showAdminOrders(interaction, 'pending');
-              } else if (ordersSub === 'pending') {
-                if (!isAdmin) {
-                  return await interaction.reply({ content: '❌ You must be an Administrator to use this subcommand.', flags: MessageFlags.Ephemeral });
-                }
-                await handlePending(interaction);
-              } else if (ordersSub === 'manage') {
-                if (!isAdmin) {
-                  return await interaction.reply({ content: '❌ You must be an Administrator to use this subcommand.', flags: MessageFlags.Ephemeral });
-                }
-                await showAdminOrders(interaction, 'pending');
-              } else if (ordersSub === 'batch') {
-                if (!isAdmin) {
-                  return await interaction.reply({ content: '❌ You must be an Administrator to use this subcommand.', flags: MessageFlags.Ephemeral });
-                }
-                await showAdminBatch(interaction);
-              }
+              await showAdminOrders(interaction, 'pending');
             } else if (interaction.commandName === 'history') {
               await showAdminOrders(interaction, 'paid_fulfilled');
             } else if (interaction.commandName === 'forceconfirm') {
               const orderId = interaction.options.getString('order_id');
               if (orderId) {
-                // Check if it's a deposit first
-                const depositDoc = await db.collection('guilds').doc(interaction.guildId!).collection('deposits').doc(orderId).get();
-                if (depositDoc.exists) {
-                  const depositData = depositDoc.data()!;
-                  if (depositData.status === 'confirmed') {
-                    return await interaction.reply({ content: '❌ This deposit has already been confirmed.', flags: MessageFlags.Ephemeral });
-                  }
-                  const depositUserId: string = depositData.userId;
-                  const depositAmount: number = depositData.amount;
-                  const customerRef = db.collection('guilds').doc(interaction.guildId!).collection('customers').doc(depositUserId);
-                  await db.runTransaction(async (txn) => {
-                    const doc = await txn.get(customerRef);
-                    const bal: number = doc.exists ? (doc.data()?.creditBalance || 0) : 0;
-                    const newBal = Math.round((bal + depositAmount) * 100) / 100;
-                    txn.set(customerRef, { userId: depositUserId, creditBalance: newBal, lastCreditReason: `Deposit ${orderId}`, lastCreditAdjustment: serverTimestamp() }, { merge: true });
-                  });
-                  await depositDoc.ref.update({ status: 'confirmed' });
-                  try {
-                    const customerDoc2 = await customerRef.get();
-                    const finalBal: number = customerDoc2.data()?.creditBalance || 0;
-                    const targetUser = await client.users.fetch(depositUserId);
-                    const dm = await targetUser.createDM();
-                    await dm.send(`✅ **${interaction.guild?.name}**: Your deposit of **$${depositAmount.toFixed(2)}** was confirmed! Your wallet balance is now **$${finalBal.toFixed(2)}**.`);
-                  } catch {}
-                  return await interaction.reply({ content: `✅ Deposit \`${orderId}\` ($${depositAmount.toFixed(2)}) manually confirmed.`, flags: MessageFlags.Ephemeral });
-                }
-                // Otherwise treat as an order
                 const orderDoc = await db.collection('orders').doc(orderId).get();
                 if (!orderDoc.exists || orderDoc.data()?.guildId !== interaction.guildId) {
-                  return await interaction.reply({ content: '❌ Order or deposit not found in this server.', flags: MessageFlags.Ephemeral });
+                  return await interaction.reply({ content: '❌ Order not found in this server.', flags: MessageFlags.Ephemeral });
                 }
                 await fulfillOrder(orderId);
                 await interaction.reply({ content: `✅ Order ${orderId} manually confirmed.`, flags: MessageFlags.Ephemeral });
@@ -1326,52 +936,48 @@ async function initDiscordBot() {
                 await db.collection('orders').doc(orderId).update({ status: 'cancelled' });
                 await interaction.reply({ content: `✅ Order ${orderId} cancelled.`, flags: MessageFlags.Ephemeral });
               }
+            } else if (interaction.commandName === 'setnickname') {
+              const nickname = interaction.options.getString('nickname');
+              try {
+                if (interaction.guild?.members.me) {
+                  await interaction.guild.members.me.setNickname(nickname);
+                  await interaction.reply({ content: `✅ Bot nickname changed to **${nickname}**.`, flags: MessageFlags.Ephemeral });
+                } else {
+                  await interaction.reply({ content: '❌ Could not change nickname.', flags: MessageFlags.Ephemeral });
+                }
+              } catch (e) {
+                await interaction.reply({ content: '❌ Missing permissions to change nickname.', flags: MessageFlags.Ephemeral });
+              }
+            } else if (interaction.commandName === 'admin_setup') {
+              await handleSetup(interaction);
+            } else if (interaction.commandName === 'revenue') {
+              await handleRevenue(interaction);
             } else if (interaction.commandName === 'setprice') {
               await handleSetPrice(interaction);
             } else if (interaction.commandName === 'setpayment') {
               await handleSetPayment(interaction);
             } else if (interaction.commandName === 'branding') {
-              const brandingSub = (interaction.options as any).getSubcommand();
-              if (brandingSub === 'customize') {
-                await handleBranding(interaction);
-              } else if (brandingSub === 'nickname') {
-                const nickname = interaction.options.getString('nickname');
-                try {
-                  if (interaction.guild?.members.me) {
-                    await interaction.guild.members.me.setNickname(nickname);
-                    await interaction.reply({ content: `✅ Bot nickname changed to **${nickname}**.`, flags: MessageFlags.Ephemeral });
-                  } else {
-                    await interaction.reply({ content: '❌ Could not change nickname.', flags: MessageFlags.Ephemeral });
-                  }
-                } catch (e) {
-                  await interaction.reply({ content: '❌ Missing permissions to change nickname.', flags: MessageFlags.Ephemeral });
-                }
-              } else if (brandingSub === 'channel') {
-                await handleRenameChannel(interaction);
-              }
+              await handleBranding(interaction);
             } else if (interaction.commandName === 'toggle') {
               await handleToggle(interaction);
+            } else if (interaction.commandName === 'pending') {
+              await handlePending(interaction);
+            } else if (interaction.commandName === 'settings') {
+              await handleSettings(interaction);
             } else if (interaction.commandName === 'blacklist') {
               await handleBlacklist(interaction);
+            } else if (interaction.commandName === 'customers') {
+              await handleCustomers(interaction);
             } else if (interaction.commandName === 'announcements') {
               await handleAnnouncements(interaction);
             } else if (interaction.commandName === 'fulfillall') {
               await handleFulfillAll(interaction);
             } else if (interaction.commandName === 'storestatus') {
               await handleStoreStatus(interaction);
-            } else if (interaction.commandName === 'report') {
-              const reportSub = (interaction.options as any).getSubcommand();
-              if (reportSub === 'revenue') {
-                await handleRevenue(interaction);
-              } else if (reportSub === 'history') {
-                await showAdminOrders(interaction, 'paid_fulfilled');
-              } else if (reportSub === 'stats') {
-                await handleStats(interaction);
-              } else if (reportSub === 'customers') {
-                await handleCustomers(interaction);
-              } else if (reportSub === 'export') {
-                await handleExport(interaction);
-              }
+            } else if (interaction.commandName === 'renamechannel') {
+              await handleRenameChannel(interaction);
+            } else if (interaction.commandName === 'export') {
+              await handleExport(interaction);
             } else if (interaction.commandName === 'format') {
               await handleFormat(interaction);
             } else if (interaction.commandName === 'setwebhook') {
@@ -1380,19 +986,20 @@ async function initDiscordBot() {
               await handleTest(interaction);
             } else if (interaction.commandName === 'credit') {
               await handleCredit(interaction);
-            } else if (interaction.commandName === 'round') {
-              const roundSub = (interaction.options as any).getSubcommand();
-              if (roundSub === 'pause') {
-                await handlePause(interaction);
-              } else if (roundSub === 'summary') {
-                await handleRoundSummary(interaction);
-              } else if (roundSub === 'export') {
-                await handleExportRound(interaction);
-              }
+            } else if (interaction.commandName === 'pause') {
+              await handlePause(interaction);
             } else if (interaction.commandName === 'dm') {
               await handleDm(interaction);
+            } else if (interaction.commandName === 'stats') {
+              await handleStats(interaction);
             } else if (interaction.commandName === 'formatorderfoodie') {
               await handleFormatOrderFoodie(interaction);
+            } else if (interaction.commandName === 'manualorder') {
+              await handleManualOrder(interaction);
+            } else if (interaction.commandName === 'roundsummary') {
+              await handleRoundSummary(interaction);
+            } else if (interaction.commandName === 'exportround') {
+              await handleExportRound(interaction);
             } else {
               await interaction.reply({ content: `🛠️ Command \`/${interaction.commandName}\` is under construction.`, flags: MessageFlags.Ephemeral });
             }
@@ -1402,83 +1009,6 @@ async function initDiscordBot() {
         }
 
         if (interaction.type === InteractionType.ModalSubmit) {
-          if (interaction.customId === 'payment_email_modal') {
-            if (!interaction.memberPermissions?.has('Administrator')) {
-              return await interaction.reply({ content: '❌ Administrators only.', flags: MessageFlags.Ephemeral });
-            }
-            const paymentImapEmail    = interaction.fields.getTextInputValue('payment_imap_email').trim();
-            const paymentImapPassword = interaction.fields.getTextInputValue('payment_imap_password').trim();
-            const paymentImapHost     = interaction.fields.getTextInputValue('payment_imap_host').trim() || undefined;
-            if (!paymentImapEmail || !paymentImapPassword) {
-              return await interaction.reply({ content: '❌ Email and password are required.', flags: MessageFlags.Ephemeral });
-            }
-            await interaction.reply({ content: '🔌 Saving and testing connection…', flags: MessageFlags.Ephemeral });
-            try {
-              await testPaymentEmail({ email: paymentImapEmail, password: paymentImapPassword, host: paymentImapHost });
-            } catch (err: any) {
-              return await interaction.editReply({ content: `❌ Connection test failed: ${err.message}\n\nCredentials were NOT saved.` });
-            }
-            const cfg2 = await getGuildConfig(interaction.guildId!) || {};
-            const upd: any = { ...cfg2, paymentImapEmail, paymentImapPassword };
-            if (paymentImapHost) upd.paymentImapHost = paymentImapHost;
-            const ok = await updateGuildConfig(interaction.guildId!, upd);
-            if (ok) {
-              await interaction.editReply({ content: '✅ Payment email saved and verified. Auto-verification is now active for Cash App, Venmo, Zelle, and PayPal.' });
-            } else {
-              await interaction.editReply({ content: '❌ Connection verified but failed to save. Try again.' });
-            }
-            return;
-          }
-
-          if (interaction.customId === 'zelle_credentials_modal') {
-            if (!interaction.memberPermissions?.has('Administrator')) {
-              return await interaction.reply({ content: '❌ Administrators only.', flags: MessageFlags.Ephemeral });
-            }
-            const zelleImapEmail    = interaction.fields.getTextInputValue('zelle_imap_email').trim();
-            const zelleImapPassword = interaction.fields.getTextInputValue('zelle_imap_password').trim();
-            const zelleImapHost     = interaction.fields.getTextInputValue('zelle_imap_host').trim() || undefined;
-            if (!zelleImapEmail || !zelleImapPassword) {
-              return await interaction.reply({ content: '❌ Email and password are required.', flags: MessageFlags.Ephemeral });
-            }
-            await interaction.reply({ content: '🔌 Saving and testing connection…', flags: MessageFlags.Ephemeral });
-            try {
-              await testZelleConnection({ email: zelleImapEmail, password: zelleImapPassword, host: zelleImapHost });
-            } catch (err: any) {
-              return await interaction.editReply({ content: `❌ Connection test failed: ${err.message}\n\nCredentials were NOT saved.` });
-            }
-            const config = await getGuildConfig(interaction.guildId!) || {};
-            const updates: any = { ...config, zelleImapEmail, zelleImapPassword };
-            if (zelleImapHost) updates.zelleImapHost = zelleImapHost;
-            const success = await updateGuildConfig(interaction.guildId!, updates);
-            if (success) {
-              await interaction.editReply({ content: '✅ Zelle credentials saved and connection verified. Auto-verification is now active.' });
-            } else {
-              await interaction.editReply({ content: '❌ Connection verified but failed to save credentials. Try again.' });
-            }
-            return;
-          }
-
-          if (interaction.customId === 'cashapp_cookie_modal') {
-            if (!interaction.memberPermissions?.has('Administrator')) {
-              return await interaction.reply({ content: '❌ Administrators only.', flags: MessageFlags.Ephemeral });
-            }
-            const rawCookie = interaction.fields.getTextInputValue('cashapp_cookie_value').trim();
-            if (!rawCookie) {
-              return await interaction.reply({ content: '❌ Cookie value cannot be empty.', flags: MessageFlags.Ephemeral });
-            }
-            const config = await getGuildConfig(interaction.guildId!) || {};
-            const success = await updateGuildConfig(interaction.guildId!, { ...config, cashappCookie: rawCookie });
-            if (success) {
-              await interaction.reply({
-                content: '✅ Cash App cookie saved for this server. Auto-verification is now active.',
-                flags: MessageFlags.Ephemeral,
-              });
-            } else {
-              await interaction.reply({ content: '❌ Failed to save cookie. Check server logs.', flags: MessageFlags.Ephemeral });
-            }
-            return;
-          }
-
           if (interaction.customId === 'manual_info_modal') {
             const rawPhone = interaction.fields.getTextInputValue('manual_phone');
             if (!/^[+]?[\d\s()\-]{7,20}$/.test(rawPhone)) {
@@ -1502,7 +1032,6 @@ async function initDiscordBot() {
               const geoRes = await fetch(`https://api.zippopotam.us/us/${zipCode}`);
               if (!geoRes.ok) throw new Error('Zip not found');
               const geoData: any = await geoRes.json();
-              if (!geoData.places || geoData.places.length === 0) throw new Error('No places returned for zip');
               lat = parseFloat(geoData.places[0].latitude);
               lng = parseFloat(geoData.places[0].longitude);
               stateAbbr = geoData.places[0]['state abbreviation'];
@@ -1549,10 +1078,7 @@ async function initDiscordBot() {
               const res = await fetch('https://overpass-api.de/api/interpreter', { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: `data=${encodeURIComponent(query)}` });
               if (!res.ok) throw new Error('Overpass error');
               const data: any = await res.json();
-              const results = (data.elements || [])
-                .filter((e: any) => (e.lat ?? e.center?.lat) != null && (e.lon ?? e.center?.lon) != null)
-                .map((e: any) => toStore(e.lat ?? e.center?.lat, e.lon ?? e.center?.lon, e.tags || {}))
-                .sort((a: any, b: any) => a._miles - b._miles).slice(0, 5);
+              const results = (data.elements || []).map((e: any) => toStore(e.lat ?? e.center?.lat, e.lon ?? e.center?.lon, e.tags || {})).sort((a: any, b: any) => a._miles - b._miles).slice(0, 5);
               if (results.length === 0) throw new Error('No Overpass results');
               return results;
             };
@@ -1700,6 +1226,26 @@ async function initDiscordBot() {
             }
           }
 
+          if (interaction.customId === 'setup_stripe_modal') {
+            const stripeKey = interaction.fields.getTextInputValue('stripeSecretKey').trim();
+            const webhookSecret = interaction.fields.getTextInputValue('stripeWebhookSecret').trim();
+            if (stripeKey && !stripeKey.startsWith('sk_')) {
+              return await interaction.reply({ content: '❌ Invalid Stripe secret key. It must start with `sk_live_` or `sk_test_`.', flags: MessageFlags.Ephemeral });
+            }
+            if (webhookSecret && !webhookSecret.startsWith('whsec_')) {
+              return await interaction.reply({ content: '❌ Invalid webhook secret. It must start with `whsec_`.', flags: MessageFlags.Ephemeral });
+            }
+            const cfg = await getGuildConfig(interaction.guildId!) || {};
+            const updates: any = { ...cfg, stripeSecretKey: stripeKey, stripeWebhookSecret: webhookSecret };
+            const success = await updateGuildConfig(interaction.guildId!, updates);
+            if (success) {
+              guildStripeClients.delete(interaction.guildId!);
+              await handleSetup(interaction, '✅ Stripe configuration saved!');
+            } else {
+              await interaction.reply({ content: '❌ Failed to save Stripe configuration.', flags: MessageFlags.Ephemeral });
+            }
+          }
+
           if (interaction.customId === 'setup_webhook_modal') {
             const webhookUrl = interaction.fields.getTextInputValue('webhookUrl').trim();
             const statusChannelId = interaction.fields.getTextInputValue('statusChannelId').trim();
@@ -1722,13 +1268,13 @@ async function initDiscordBot() {
             const cashapp = interaction.fields.getTextInputValue('cashapp').trim();
             const venmo = interaction.fields.getTextInputValue('venmo').trim();
             const zelle = interaction.fields.getTextInputValue('zelle').trim();
-            const paypal = interaction.fields.getTextInputValue('paypal').trim();
+            const crypto = interaction.fields.getTextInputValue('crypto').trim();
             const cfg = await getGuildConfig(interaction.guildId!) || {};
             const updates: any = { ...cfg };
             if (cashapp) updates.cashappTag = cashapp;
             if (venmo) updates.venmoHandle = venmo;
             if (zelle) updates.zelleEmail = zelle;
-            if (paypal) updates.paypalEmail = paypal;
+            if (crypto) updates.cryptoAddress = crypto;
             const success = await updateGuildConfig(interaction.guildId!, updates);
             if (success) {
               await handleSetup(interaction, '✅ Payment methods saved!');
@@ -1788,8 +1334,8 @@ async function initDiscordBot() {
 
             const rawEntrees = interaction.fields.getTextInputValue('entrees').trim();
             const parsedEntrees = parseInt(rawEntrees, 10);
-            if (isNaN(parsedEntrees) || parsedEntrees < 1 || parsedEntrees > 8) {
-              return await interaction.reply({ content: '❌ Please enter a number of entrees between 1 and 8.', flags: MessageFlags.Ephemeral });
+            if (isNaN(parsedEntrees) || parsedEntrees < 1 || parsedEntrees > 9) {
+              return await interaction.reply({ content: '❌ Please enter a number of entrees between 1 and 9.', flags: MessageFlags.Ephemeral });
             }
 
             await interaction.deferUpdate();
@@ -1800,7 +1346,6 @@ async function initDiscordBot() {
               const geoRes = await fetch(`https://api.zippopotam.us/us/${zipCode}`);
               if (!geoRes.ok) throw new Error('Zip not found');
               const geoData: any = await geoRes.json();
-              if (!geoData.places || geoData.places.length === 0) throw new Error('No places returned for zip');
               lat = parseFloat(geoData.places[0].latitude);
               lng = parseFloat(geoData.places[0].longitude);
               stateAbbr = geoData.places[0]['state abbreviation'];
@@ -1867,7 +1412,6 @@ async function initDiscordBot() {
               if (!res.ok) throw new Error('Overpass error');
               const data: any = await res.json();
               const results = (data.elements || [])
-                .filter((e: any) => (e.lat ?? e.center?.lat) != null && (e.lon ?? e.center?.lon) != null)
                 .map((e: any) => toStore(e.lat ?? e.center?.lat, e.lon ?? e.center?.lon, e.tags || {}))
                 .sort((a: any, b: any) => a._miles - b._miles)
                 .slice(0, 5);
@@ -1932,41 +1476,6 @@ async function initDiscordBot() {
               components: [storeRow]
             });
           }
-
-          if (interaction.customId === 'item_name_modal') {
-            const state = orderState.get(`${interaction.user.id}:${interaction.guildId}`);
-            if (!state) return await interaction.reply({ content: '❌ Session expired. Use `/order` to start over.', flags: MessageFlags.Ephemeral });
-            const entreeNameVal = interaction.fields.getTextInputValue('item_name').trim();
-            if (state.orders.length > 0) {
-              state.orders[state.orders.length - 1].entreeName = entreeNameVal || '';
-            }
-            await interaction.deferUpdate();
-            await showReview(interaction, state);
-          }
-
-          if (interaction.customId === 'repeat_order_modal') {
-            const state = orderState.get(`${interaction.user.id}:${interaction.guildId}`);
-            if (!state) return await interaction.reply({ content: '❌ Session expired. Use `/order` to start over.', flags: MessageFlags.Ephemeral });
-            const rawCount = interaction.fields.getTextInputValue('repeat_count').trim();
-            const count = parseInt(rawCount, 10);
-            if (isNaN(count) || count < 2 || count > 9) {
-              return await interaction.reply({ content: '❌ Please enter a number between 2 and 9.', flags: MessageFlags.Ephemeral });
-            }
-            // Duplicate current orders: replace state.orders with count copies
-            const original = [...state.orders];
-            const repeated: any[] = [];
-            for (let i = 0; i < count; i++) {
-              for (const item of original) {
-                if (repeated.length >= 9) break;
-                repeated.push({ ...item });
-              }
-              if (repeated.length >= 9) break;
-            }
-            state.orders = repeated;
-            state.maxEntrees = repeated.length;
-            await interaction.deferUpdate();
-            await showReview(interaction, state);
-          }
         }
 
         if (interaction.isStringSelectMenu() || interaction.isButton()) {
@@ -2005,7 +1514,20 @@ async function initDiscordBot() {
                     { name: 'Items', value: formattedOrders || 'No items' }
                   );
 
-                const row = makeSelect(`admin_status_update_${orderId}`, 'Update status', ORDER_STATUS_OPTIONS);
+                const statusSelect = new StringSelectMenuBuilder()
+                  .setCustomId(`admin_status_update_${orderId}`)
+                  .setPlaceholder('Update status')
+                  .addOptions([
+                    { label: '🕐 Pending', value: 'pending' },
+                    { label: '💸 Pending Cash App', value: 'pending_cashapp' },
+                    { label: '🔵 Pending Venmo', value: 'pending_venmo' },
+                    { label: '🟣 Pending Zelle', value: 'pending_zelle' },
+                    { label: '🪙 Pending Crypto', value: 'pending_crypto' },
+                    { label: '✅ Paid', value: 'paid' },
+                    { label: '🎉 Fulfilled', value: 'paid_fulfilled' }
+                  ]);
+                
+                const row = new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(statusSelect);
                 const backBtn = new ButtonBuilder()
                   .setCustomId('admin_back_to_orders')
                   .setLabel('Back to Orders')
@@ -2061,26 +1583,21 @@ async function initDiscordBot() {
                 await showAdminOrders(interaction, 'pending');
               } else if (interaction.customId === 'admin_pending_confirm_all') {
                 await interaction.deferUpdate();
-                const pendingStatuses = ['pending', 'pending_cashapp', 'pending_venmo', 'pending_zelle', 'pending_crypto', 'pending_paypal'];
+                const pendingStatuses = ['pending', 'pending_cashapp', 'pending_venmo', 'pending_zelle', 'pending_crypto'];
                 let confirmedCount = 0;
                 let failedCount = 0;
-                const statusSnaps = await Promise.all(
-                  pendingStatuses.map(status =>
-                    db.collection('orders').where('status', '==', status).where('guildId', '==', interaction.guildId).get()
-                  )
-                );
-                const allDocs = statusSnaps.flatMap(snap => snap.docs);
-                const results = await Promise.all(
-                  allDocs.map(orderDoc =>
-                    fulfillOrder(orderDoc.id).then(success => ({ success })).catch(e => {
+                for (const status of pendingStatuses) {
+                  const snap = await db.collection('orders').where('status', '==', status).where('guildId', '==', interaction.guildId).get();
+                  for (const orderDoc of snap.docs) {
+                    try {
+                      const success = await fulfillOrder(orderDoc.id);
+                      if (success) confirmedCount++;
+                      else failedCount++;
+                    } catch (e) {
                       console.error(`Failed to fulfill order ${orderDoc.id}:`, e);
-                      return { success: false };
-                    })
-                  )
-                );
-                for (const r of results) {
-                  if (r.success) confirmedCount++;
-                  else failedCount++;
+                      failedCount++;
+                    }
+                  }
                 }
                 const config = await getGuildConfig(interaction.guildId!) || {};
                 let description = confirmedCount > 0
@@ -2093,15 +1610,33 @@ async function initDiscordBot() {
                 await interaction.editReply({ embeds: [embed], components: [] });
               } else if (interaction.customId.startsWith('admin_confirm_all_')) {
                 await interaction.deferUpdate();
-                const { status: statusToConfirm, name: paymentName } = CONFIRM_ALL_STATUS_MAP[interaction.customId] || { status: 'pending', name: '' };
+                let statusToConfirm = 'pending';
+                let paymentName = '';
+                
+                if (interaction.customId === 'admin_confirm_all_cashapp') {
+                  statusToConfirm = 'pending_cashapp';
+                  paymentName = 'Cash App ';
+                } else if (interaction.customId === 'admin_confirm_all_venmo') {
+                  statusToConfirm = 'pending_venmo';
+                  paymentName = 'Venmo ';
+                } else if (interaction.customId === 'admin_confirm_all_zelle') {
+                  statusToConfirm = 'pending_zelle';
+                  paymentName = 'Zelle ';
+                } else if (interaction.customId === 'admin_confirm_all_crypto') {
+                  statusToConfirm = 'pending_crypto';
+                  paymentName = 'Crypto ';
+                }
 
                 const ordersQuery = db.collection('orders').where('status', '==', statusToConfirm).where('guildId', '==', interaction.guildId);
                 const ordersSnapshot = await ordersQuery.get();
 
-                const fulfillResults = await Promise.all(
-                  ordersSnapshot.docs.map(orderDoc => fulfillOrder(orderDoc.id))
-                );
-                let confirmedCount = fulfillResults.filter(Boolean).length;
+                let confirmedCount = 0;
+                for (const orderDoc of ordersSnapshot.docs) {
+                  const orderId = orderDoc.id;
+
+                  await fulfillOrder(orderId);
+                  confirmedCount++;
+                }
 
                 const config = await getGuildConfig(interaction.guildId!) || {};
                 const embed = createEmbed(config)
@@ -2144,6 +1679,19 @@ async function initDiscordBot() {
             }
             const cfg = await getGuildConfig(interaction.guildId!) || {};
 
+            if (interaction.customId === 'setup_stripe') {
+              const modal = new ModalBuilder().setCustomId('setup_stripe_modal').setTitle('💳 Stripe Configuration');
+              const keyInput = new TextInputBuilder().setCustomId('stripeSecretKey').setLabel('Stripe Secret Key (sk_live_ or sk_test_...)').setStyle(TextInputStyle.Short).setRequired(true).setPlaceholder('sk_live_...');
+              if (cfg.stripeSecretKey) keyInput.setValue(cfg.stripeSecretKey);
+              const secretInput = new TextInputBuilder().setCustomId('stripeWebhookSecret').setLabel('Stripe Webhook Secret (whsec_...)').setStyle(TextInputStyle.Short).setRequired(true).setPlaceholder('whsec_...');
+              if (cfg.stripeWebhookSecret) secretInput.setValue(cfg.stripeWebhookSecret);
+              modal.addComponents(
+                new ActionRowBuilder<ModalActionRowComponentBuilder>().addComponents(keyInput),
+                new ActionRowBuilder<ModalActionRowComponentBuilder>().addComponents(secretInput),
+              );
+              return await interaction.showModal(modal);
+            }
+
             if (interaction.customId === 'setup_webhook') {
               const modal = new ModalBuilder().setCustomId('setup_webhook_modal').setTitle('🔗 Webhook & Status Channel');
               const webhookInput = new TextInputBuilder().setCustomId('webhookUrl').setLabel('Order Notifications Webhook URL').setStyle(TextInputStyle.Short).setRequired(false).setPlaceholder('https://discord.com/api/webhooks/...');
@@ -2165,13 +1713,13 @@ async function initDiscordBot() {
               if (cfg.venmoHandle) venmoInput.setValue(cfg.venmoHandle);
               const zelleInput = new TextInputBuilder().setCustomId('zelle').setLabel('Zelle Email or Phone').setStyle(TextInputStyle.Short).setRequired(false).setPlaceholder('email@example.com or +1...');
               if (cfg.zelleEmail) zelleInput.setValue(cfg.zelleEmail);
-              const paypalInput = new TextInputBuilder().setCustomId('paypal').setLabel('PayPal Email').setStyle(TextInputStyle.Short).setRequired(false).setPlaceholder('you@email.com');
-              if (cfg.paypalEmail) paypalInput.setValue(cfg.paypalEmail);
+              const cryptoInput = new TextInputBuilder().setCustomId('crypto').setLabel('Crypto Wallet Address (optional)').setStyle(TextInputStyle.Short).setRequired(false).setPlaceholder('0x...');
+              if (cfg.cryptoAddress) cryptoInput.setValue(cfg.cryptoAddress);
               modal.addComponents(
                 new ActionRowBuilder<ModalActionRowComponentBuilder>().addComponents(cashInput),
                 new ActionRowBuilder<ModalActionRowComponentBuilder>().addComponents(venmoInput),
                 new ActionRowBuilder<ModalActionRowComponentBuilder>().addComponents(zelleInput),
-                new ActionRowBuilder<ModalActionRowComponentBuilder>().addComponents(paypalInput),
+                new ActionRowBuilder<ModalActionRowComponentBuilder>().addComponents(cryptoInput),
               );
               return await interaction.showModal(modal);
             }
@@ -2269,7 +1817,7 @@ async function initDiscordBot() {
               state.info.location = interaction.values[0].replace(/^\d+:/, '');
               state.lastUpdated = Date.now();
               await showPickupTimeSelect(interaction, state);
-            } else if (interaction.customId === 'pickup_time_select' || interaction.customId.startsWith('pickup_time_select_')) {
+            } else if (['pickup_time_select', 'pickup_time_select_1', 'pickup_time_select_2'].includes(interaction.customId)) {
               await interaction.deferUpdate();
               state.info.time = interaction.values[0];
               state.lastUpdated = Date.now();
@@ -2317,32 +1865,16 @@ async function initDiscordBot() {
               } else {
                 state.orders.push(state.currentOrder);
               }
-
-              // If ordering multiple entrees and not editing, ask who this entree is for
-              if (!isEditing && (state.maxEntrees || 1) > 1) {
-                const itemIndex = state.orders.length;
-                const nameModal = new ModalBuilder()
-                  .setCustomId('item_name_modal')
-                  .setTitle(`Entree ${itemIndex} — Who is this for?`);
-                const nameInput = new TextInputBuilder()
-                  .setCustomId('item_name')
-                  .setLabel(`Name for entree ${itemIndex} (optional)`)
-                  .setStyle(TextInputStyle.Short)
-                  .setPlaceholder('e.g. John')
-                  .setRequired(false);
-                nameModal.addComponents(
-                  new ActionRowBuilder<ModalActionRowComponentBuilder>().addComponents(nameInput)
-                );
-                return await interaction.showModal(nameModal);
-              }
-
+              
               const type = state.currentOrder.type;
               const emoji = type.includes('Bowl') ? '🥗' : (type === 'Tacos' ? '🌮' : '🌯');
               const actionText = isEditing ? 'Updating your' : 'Wrapping your';
-
+              
               await interaction.update({ content: `${emoji} ${actionText} ${type.toLowerCase()}...`, components: [], embeds: [] });
+              await new Promise(resolve => setTimeout(resolve, 800));
               await interaction.editReply({ content: `✅ Item ${isEditing ? 'updated' : 'added to cart'}!`, components: [], embeds: [] });
-
+              await new Promise(resolve => setTimeout(resolve, 800));
+              
               await showReview(interaction, state);
             } else if (interaction.customId === 'edit_item_select') {
               const index = parseInt(interaction.values[0]);
@@ -2386,21 +1918,6 @@ async function initDiscordBot() {
               } else {
                 await showPremiumSelect(interaction, state);
               }
-            } else if (interaction.customId === 'repeat_order_start') {
-              const maxCopies = Math.floor(9 / state.orders.length);
-              const repeatModal = new ModalBuilder()
-                .setCustomId('repeat_order_modal')
-                .setTitle('Repeat Order');
-              const countInput = new TextInputBuilder()
-                .setCustomId('repeat_count')
-                .setLabel(`How many total copies? (2–${Math.min(maxCopies, 9)})`)
-                .setStyle(TextInputStyle.Short)
-                .setPlaceholder('e.g. 3')
-                .setRequired(true);
-              repeatModal.addComponents(
-                new ActionRowBuilder<ModalActionRowComponentBuilder>().addComponents(countInput)
-              );
-              return await interaction.showModal(repeatModal);
             } else if (interaction.customId === 'add_more') {
               state.currentOrder = { type: '', proteins: [], rice: { type: 'None' }, beans: { type: 'None' }, toppings: [], selectedToppings: [], premiums: [] };
               await showEntreeSelect(interaction, state);
@@ -2414,18 +1931,18 @@ async function initDiscordBot() {
 
                 const config = await getGuildConfig(interaction.guildId!) || {};
                 const basePrice = config.basePrice || 5.00;
-                const bulkPrice = config.bulkPrice ?? null;
-                const bulkThreshold = config.bulkThreshold ?? null;
+                const bulkPrice = config.bulkPrice;
+                const bulkThreshold = config.bulkThreshold;
 
                 // Calculate actual price
                 let totalPrice = 0;
                 const numEntrees = state.orders.length;
-                const currentBasePrice = (bulkPrice !== null && bulkThreshold !== null && numEntrees >= bulkThreshold) ? bulkPrice : basePrice;
+                const currentBasePrice = (bulkPrice && bulkThreshold && numEntrees >= bulkThreshold) ? bulkPrice : basePrice;
 
                 state.orders.forEach((order: any) => {
-                  totalPrice += currentBasePrice;
+                  let entreePrice = currentBasePrice;
+                  totalPrice += entreePrice;
                 });
-                totalPrice = Math.round(totalPrice * 100) / 100;
 
                 const orderDataStr = JSON.stringify(state.orders);
                 const userInfoStr = JSON.stringify(state.info);
@@ -2435,16 +1952,13 @@ async function initDiscordBot() {
                   return await interaction.followUp({ content: '❌ Database error. Please contact the administrator.', flags: MessageFlags.Ephemeral });
                 }
 
-                // Stop any running Cash App or Zelle poller when returning to payment options
-                const existingCashappPoller = cashappPollers.get(`cashapp:${interaction.user.id}:${interaction.guildId!}`);
-                if (existingCashappPoller) {
-                  clearInterval(existingCashappPoller.interval);
-                  clearTimeout(existingCashappPoller.timeout);
-                  cashappPollers.delete(`cashapp:${interaction.user.id}:${interaction.guildId!}`);
-                }
-                for (const provider of ['cashapp', 'venmo', 'zelle', 'paypal']) {
-                  const ep = emailPaymentPollers.get(`email:${provider}:${interaction.user.id}:${interaction.guildId!}`);
-                  if (ep) { clearInterval(ep.interval); clearTimeout(ep.timeout); emailPaymentPollers.delete(`email:${provider}:${interaction.user.id}:${interaction.guildId!}`); }
+                // Stop any running Stripe poller when returning to payment options
+                const existingPoller = stripePollers.get(`${interaction.user.id}:${interaction.guildId!}`);
+                if (existingPoller) {
+                  clearInterval(existingPoller.interval);
+                  clearTimeout(existingPoller.timeout);
+                  stripePollers.delete(`${interaction.user.id}:${interaction.guildId!}`);
+                  state.stripeSessionId = undefined;
                 }
 
                 // Reuse existing pending order if there is one, to avoid orphaned orders
@@ -2487,18 +2001,9 @@ async function initDiscordBot() {
                 state.currentOrderId = orderId;
                 state.totalPrice = totalPrice;
 
-                // Check user's wallet balance
-                const walletDoc = await db.collection('guilds').doc(interaction.guildId!).collection('customers').doc(interaction.user.id).get();
-                const walletBalance: number = walletDoc.exists ? (walletDoc.data()?.creditBalance || 0) : 0;
-
                 const buttons: ButtonBuilder[] = [];
-
-                // Wallet button — show if user has any balance
-                if (walletBalance >= totalPrice) {
-                  buttons.push(new ButtonBuilder().setCustomId('pay_wallet').setLabel(`💳 Pay with Wallet ($${walletBalance.toFixed(2)})`).setStyle(ButtonStyle.Success));
-                } else if (walletBalance >= 0.01) {
-                  buttons.push(new ButtonBuilder().setCustomId('pay_wallet_partial').setLabel(`💳 Use $${walletBalance.toFixed(2)} Wallet + Pay Rest`).setStyle(ButtonStyle.Secondary));
-                }
+                const stripeBtn = new ButtonBuilder().setCustomId('pay_stripe').setLabel('💳 Pay with Stripe').setStyle(ButtonStyle.Primary);
+                buttons.push(stripeBtn);
 
                 if (config.cashappTag) {
                   buttons.push(new ButtonBuilder().setCustomId('pay_cashapp').setLabel('💸 Pay with Cash App').setStyle(ButtonStyle.Success));
@@ -2508,9 +2013,6 @@ async function initDiscordBot() {
                 }
                 if (config.zelleEmail) {
                   buttons.push(new ButtonBuilder().setCustomId('pay_zelle').setLabel('🟣 Pay with Zelle').setStyle(ButtonStyle.Secondary));
-                }
-                if (config.paypalEmail) {
-                  buttons.push(new ButtonBuilder().setCustomId('pay_paypal').setLabel('🅿️ Pay with PayPal').setStyle(ButtonStyle.Primary));
                 }
                 if (config.cryptoAddress) {
                   buttons.push(new ButtonBuilder().setCustomId('pay_crypto').setLabel('🪙 Pay with Crypto').setStyle(ButtonStyle.Secondary));
@@ -2537,12 +2039,9 @@ async function initDiscordBot() {
                 currentRow.addComponents(backBtn);
                 rows.push(currentRow);
                 
-                const walletLine = walletBalance >= 0.01
-                  ? `\n💳 Wallet balance: **$${walletBalance.toFixed(2)}**${walletBalance >= totalPrice ? ' — enough to cover this order!' : ` — $${(totalPrice - walletBalance).toFixed(2)} short`}`
-                  : '';
-                await interaction.editReply({
-                  content: `💰 Your order total is **$${totalPrice.toFixed(2)}**.\n\n💳 Please select your preferred payment method:${walletLine}`,
-                  components: rows
+                await interaction.editReply({ 
+                  content: `💰 Your order total is **$${totalPrice.toFixed(2)}**.\n\n💳 Please select your preferred payment method:`,
+                  components: rows 
                 });
               } catch (err: any) {
                 console.error('Checkout Error:', err);
@@ -2564,88 +2063,146 @@ async function initDiscordBot() {
               const file = new AttachmentBuilder(buf, { name: 'manual_order.txt' });
               orderState.delete(`${interaction.user.id}:${interaction.guildId}`);
               await interaction.editReply({ content: '✅ Manual order printed.', embeds: [], components: [], files: [file] });
-            } else if (interaction.customId === 'pay_wallet') {
+            } else if (interaction.customId === 'pay_stripe') {
               try {
                 await interaction.deferUpdate();
-                if (!state.currentOrderId || !state.totalPrice) {
-                  return await interaction.followUp({ content: '❌ No active order found.', flags: MessageFlags.Ephemeral });
+                const stripe = await getStripeForGuild(interaction.guildId!);
+                if (!stripe) {
+                  return await interaction.followUp({ content: '❌ Stripe is not configured for this server. An admin must run `/admin_setup` to add a Stripe key.', flags: MessageFlags.Ephemeral });
                 }
-                const config = await getGuildConfig(interaction.guildId!) || {};
-                const customerRef = db.collection('guilds').doc(interaction.guildId!).collection('customers').doc(interaction.user.id);
 
-                // Atomically deduct — prevents double-spend
-                let newBalance = 0;
-                await db.runTransaction(async (txn) => {
-                  const doc = await txn.get(customerRef);
-                  const balance: number = doc.exists ? (doc.data()?.creditBalance || 0) : 0;
-                  if (balance < state.totalPrice) throw new Error('Insufficient wallet balance');
-                  newBalance = Math.round((balance - state.totalPrice) * 100) / 100;
-                  txn.set(customerRef, { creditBalance: newBalance, lastCreditReason: `Order ${state.currentOrderId}`, lastCreditAdjustment: serverTimestamp() }, { merge: true });
+                const session = await stripe.checkout.sessions.create({
+                  payment_method_types: ['card'],
+                  line_items: [{
+                    price_data: {
+                      currency: 'usd',
+                      product_data: {
+                        name: state.orders.map((o: any) => o.type).join(', '),
+                        description: `${state.orders.length} Entree(s)`,
+                      },
+                      unit_amount: Math.round(state.totalPrice * 100),
+                    },
+                    quantity: 1,
+                  }],
+                  mode: 'payment',
+                  success_url: 'https://discord.com/channels/@me',
+                  cancel_url: 'https://discord.com/channels/@me',
+                  client_reference_id: interaction.user.id,
+                  metadata: {
+                    orderId: state.currentOrderId,
+                    userId: interaction.user.id
+                  }
                 });
 
-                await db.collection('orders').doc(state.currentOrderId).update({ status: 'paid', paymentMethod: 'wallet' });
-                await fulfillOrder(state.currentOrderId, true);
+                state.stripeSessionId = session.id;
+                state.isFulfilled = false;
+                state.stripeInteraction = interaction;
 
-                const successEmbed = createEmbed(config)
-                  .setTitle('✅ Wallet Payment Confirmed!')
-                  .setDescription(`**$${state.totalPrice.toFixed(2)}** deducted from your wallet.\nRemaining balance: **$${newBalance.toFixed(2)}**\n\nYour order is on its way to the kitchen!`);
-                await interaction.editReply({ content: '', embeds: [successEmbed], components: [] });
-              } catch (err: any) {
-                console.error('Wallet pay error:', err);
-                await interaction.followUp({ content: `❌ ${err.message || 'Error processing wallet payment.'}`, flags: MessageFlags.Ephemeral });
-              }
-
-            } else if (interaction.customId === 'pay_wallet_partial') {
-              try {
-                await interaction.deferUpdate();
-                if (!state.currentOrderId || !state.totalPrice) {
-                  return await interaction.followUp({ content: '❌ No active order found.', flags: MessageFlags.Ephemeral });
-                }
                 const config = await getGuildConfig(interaction.guildId!) || {};
-                const customerRef = db.collection('guilds').doc(interaction.guildId!).collection('customers').doc(interaction.user.id);
+                const checkoutMsg = config.checkoutMessage || 'Please pay using the link below. Your order will be sent to the kitchen automatically once payment is confirmed.';
 
-                // Read current balance
-                const walletDoc2 = await customerRef.get();
-                const walletBal2: number = walletDoc2.exists ? (walletDoc2.data()?.creditBalance || 0) : 0;
-                if (walletBal2 < 0.01) {
-                  return await interaction.followUp({ content: '❌ No wallet balance available.', flags: MessageFlags.Ephemeral });
-                }
-                const remaining = Math.round((state.totalPrice - walletBal2) * 100) / 100;
-
-                // Deduct full wallet balance atomically
-                await db.runTransaction(async (txn) => {
-                  const doc = await txn.get(customerRef);
-                  const bal: number = doc.exists ? (doc.data()?.creditBalance || 0) : 0;
-                  txn.set(customerRef, { creditBalance: 0, lastCreditReason: `Partial: Order ${state.currentOrderId}`, lastCreditAdjustment: serverTimestamp() }, { merge: true });
-                });
-
-                // Update order total to the remaining amount and save wallet credit applied
-                state.totalPrice = remaining;
-                await db.collection('orders').doc(state.currentOrderId).update({ totalPrice: remaining, walletCreditApplied: walletBal2 });
-
-                // Now show payment buttons for the remaining amount
-                const buttons2: ButtonBuilder[] = [];
-                if (config.cashappTag) buttons2.push(new ButtonBuilder().setCustomId('pay_cashapp').setLabel('💸 Cash App').setStyle(ButtonStyle.Success));
-                if (config.venmoHandle) buttons2.push(new ButtonBuilder().setCustomId('pay_venmo').setLabel('💸 Venmo').setStyle(ButtonStyle.Primary));
-                if (config.zelleEmail) buttons2.push(new ButtonBuilder().setCustomId('pay_zelle').setLabel('💸 Zelle').setStyle(ButtonStyle.Primary));
-                if (config.paypalEmail) buttons2.push(new ButtonBuilder().setCustomId('pay_paypal').setLabel('🅿️ PayPal').setStyle(ButtonStyle.Primary));
-                if (config.cryptoAddress) buttons2.push(new ButtonBuilder().setCustomId('pay_crypto').setLabel('🪙 Crypto').setStyle(ButtonStyle.Secondary));
-
-                if (!buttons2.length) {
-                  return await interaction.followUp({ content: '❌ No payment methods configured for the remaining balance.', flags: MessageFlags.Ephemeral });
-                }
-                const row2 = new ActionRowBuilder<ButtonBuilder>().addComponents(...buttons2.slice(0, 5));
+                const payBtn = new ButtonBuilder().setLabel('Pay with Stripe').setStyle(ButtonStyle.Link).setURL(session.url!);
+                const checkBtn = new ButtonBuilder().setCustomId('check_payment').setLabel('Check Payment Status').setStyle(ButtonStyle.Primary);
+                const refreshBtn = new ButtonBuilder().setCustomId('refresh_link').setLabel('Refresh Link').setStyle(ButtonStyle.Secondary);
+                const backBtn = new ButtonBuilder().setCustomId('checkout').setLabel('Back to Payment Options').setStyle(ButtonStyle.Danger);
+                const row = new ActionRowBuilder<ButtonBuilder>().addComponents(payBtn, checkBtn, refreshBtn, backBtn);
+                
                 await interaction.editReply({
-                  content: `💳 **$${walletBal2.toFixed(2)}** wallet credit applied!\n\nPlease pay the remaining **$${remaining.toFixed(2)}** using one of the methods below:`,
-                  components: [row2],
-                  embeds: [],
+                  content: `Total: **$${state.totalPrice.toFixed(2)}**. ${checkoutMsg}\n\n*If the order doesn't process after payment, click "Check Payment Status".*`,
+                  components: [row]
                 });
-              } catch (err: any) {
-                console.error('Partial wallet pay error:', err);
-                await interaction.followUp({ content: `❌ ${err.message || 'Error processing partial wallet payment.'}`, flags: MessageFlags.Ephemeral });
-              }
 
-            } else if (['pay_cashapp', 'pay_venmo', 'pay_zelle', 'pay_crypto', 'pay_paypal'].includes(interaction.customId)) {
+                // Auto-poll Stripe every 5 seconds; fulfill automatically on payment
+                const pollerSessionId = session.id;
+                const pollerOrderId = state.currentOrderId;
+                const pollerUserId = interaction.user.id;
+                const pollerGuildIdCapture = interaction.guildId!;
+                const pollerKey = `${pollerUserId}:${pollerGuildIdCapture}`;
+
+                // Cancel any existing poller for this user+guild (handles double-click on "Pay with Stripe")
+                const existingPoller = stripePollers.get(pollerKey);
+                if (existingPoller) {
+                  clearInterval(existingPoller.interval);
+                  clearTimeout(existingPoller.timeout);
+                  stripePollers.delete(pollerKey);
+                }
+
+                const stopPoller = (key: string) => {
+                  const p = stripePollers.get(key);
+                  if (p) {
+                    clearInterval(p.interval);
+                    clearTimeout(p.timeout);
+                    stripePollers.delete(key);
+                  }
+                };
+
+                const pollerInterval = setInterval(async () => {
+                  try {
+                    const stripeClient = await getStripeForGuild(pollerGuildIdCapture);
+                    if (!stripeClient) return;
+                    const sess = await stripeClient.checkout.sessions.retrieve(pollerSessionId);
+                    if (sess.status === 'complete' && sess.payment_status === 'paid') {
+                      // Stop poller immediately — prevents retry loops if subsequent async work fails
+                      stopPoller(pollerKey);
+
+                      // Grab interaction and order data before fulfillOrder clears state
+                      const currentState = orderState.get(pollerKey);
+                      const storedInteraction = currentState?.stripeInteraction;
+                      const pollerGuildId = currentState?.guildId;
+                      const config = pollerGuildId ? (await getGuildConfig(pollerGuildId) || {}) : {};
+                      const orderDoc = await db.collection('orders').doc(pollerOrderId).get();
+                      const parsedOrders = safeParseOrders(orderDoc.data()?.orderData);
+                      const orderDetails = formatOrderItems(parsedOrders);
+
+                      await fulfillOrder(pollerOrderId, true);
+
+                      // Update the customer's Discord screen
+                      if (storedInteraction) {
+                        try {
+                          const successMsg = config.successMessage || 'Your order has been sent to the kitchen.';
+                          const successEmbed = createEmbed(config)
+                            .setTitle('🎉 Payment Confirmed — Thank You!')
+                            .setDescription(`${successMsg}\n\n**Your Order Details:**\n${orderDetails}`);
+                          await storedInteraction.editReply({ content: '', embeds: [successEmbed], components: [] });
+                        } catch (e) {
+                          console.error('Could not update screen after payment (token may have expired):', e);
+                        }
+                      }
+                    } else if (sess.status === 'expired') {
+                      stopPoller(pollerKey);
+                    }
+                  } catch (e) {
+                    console.error('Stripe poll error:', e);
+                  }
+                }, 5000);
+
+                // Stop polling after 30 minutes (matches Stripe session expiry)
+                const pollerTimeout = setTimeout(() => stopPoller(pollerKey), 30 * 60 * 1000);
+                stripePollers.set(pollerKey, { interval: pollerInterval, timeout: pollerTimeout });
+
+              } catch (err: any) {
+                console.error('Stripe Session Error:', err);
+                
+                let userMessage = 'Please try again later.';
+                if (err.type === 'StripeInvalidRequestError') {
+                  userMessage = 'There was an issue with the order details. Please review your cart and try again.';
+                } else if (err.type === 'StripeAPIError') {
+                  userMessage = 'Stripe is currently experiencing issues. Please try again later.';
+                } else if (err.type === 'StripeConnectionError') {
+                  userMessage = 'Network issue connecting to the payment provider. Please check your connection and try again.';
+                } else if (err.type === 'StripeAuthenticationError') {
+                  userMessage = 'Payment system configuration error. Please contact the administrator.';
+                } else if (err.message) {
+                  userMessage = err.message;
+                }
+
+                if (interaction.deferred || interaction.replied) {
+                  await interaction.followUp({ content: `❌ Error creating payment session: ${userMessage}`, flags: MessageFlags.Ephemeral });
+                } else {
+                  await interaction.reply({ content: `❌ Error creating payment session: ${userMessage}`, flags: MessageFlags.Ephemeral });
+                }
+              }
+            } else if (['pay_cashapp', 'pay_venmo', 'pay_zelle', 'pay_crypto'].includes(interaction.customId)) {
               try {
                 await interaction.deferUpdate();
                 const config = await getGuildConfig(interaction.guildId!) || {};
@@ -2674,208 +2231,84 @@ async function initDiscordBot() {
                   paymentInfo = `**${config.cryptoAddress}**`;
                   paymentName = 'Crypto';
                   statusName = 'crypto';
-                } else if (interaction.customId === 'pay_paypal') {
-                  if (!config.paypalEmail) return await interaction.followUp({ content: '❌ PayPal is not configured.', flags: MessageFlags.Ephemeral });
-                  paymentInfo = `**${config.paypalEmail}** on PayPal`;
-                  paymentName = 'PayPal';
-                  statusName = 'paypal';
                 }
 
                 const shortOrderId = state.currentOrderId;
-
-                const guildCashappCookie = config.cashappCookie as string | undefined;
-                const sharedEmailCfg = (config.paymentImapEmail && config.paymentImapPassword)
-                  ? { email: config.paymentImapEmail as string, password: config.paymentImapPassword as string, host: config.paymentImapHost as string | undefined }
-                  : (config.zelleImapEmail && config.zelleImapPassword)
-                    ? { email: config.zelleImapEmail as string, password: config.zelleImapPassword as string, host: config.zelleImapHost as string | undefined }
-                    : null;
-                const willAutoPoll =
-                  (statusName === 'cashapp' && (!!guildCashappCookie || !!sharedEmailCfg)) ||
-                  (statusName === 'zelle'   && !!sharedEmailCfg) ||
-                  (statusName === 'venmo'   && !!sharedEmailCfg) ||
-                  (statusName === 'paypal'  && !!sharedEmailCfg);
-
+                
                 const sentBtn = new ButtonBuilder().setCustomId(`${statusName}_sent`).setLabel('✅ I\'ve Sent the Payment').setStyle(ButtonStyle.Success);
                 const backBtn = new ButtonBuilder().setCustomId('checkout').setLabel('Back to Payment Options').setStyle(ButtonStyle.Danger);
                 const row = new ActionRowBuilder<ButtonBuilder>().addComponents(sentBtn, backBtn);
 
-                const confirmNote = willAutoPoll
-                  ? 'Send the payment then click the button below. The bot is already watching for your payment and will confirm it automatically.'
-                  : 'Once you have sent the payment, click the button below. Your order will be sent to the kitchen as soon as the admin verifies the payment.';
                 const embed = createEmbed(config)
                   .setTitle(`💸 Pay with ${paymentName}`)
-                  .setDescription(`Please send **$${state.totalPrice.toFixed(2)}** to ${paymentInfo}.\n\n**IMPORTANT:** You MUST include this exact Order Number in the "For" / Notes section of your payment:\n\n\`${shortOrderId}\`\n\n${confirmNote}`);
+                  .setDescription(`Please send **$${state.totalPrice.toFixed(2)}** to ${paymentInfo}.\n\n**IMPORTANT:** You MUST include this exact Order Number in the "For" / Notes section of your payment:\n\n\`${shortOrderId}\`\n\nOnce you have sent the payment, click the button below. Your order will be sent to the kitchen as soon as the admin verifies the payment.`);
 
                 await interaction.editReply({ content: '', embeds: [embed], components: [row] });
-
-                const stopPoller = (map: typeof cashappPollers, key: string) => {
-                  const p = map.get(key);
-                  if (p) { clearInterval(p.interval); clearTimeout(p.timeout); map.delete(key); }
-                };
-
-                // ── Cash App cookie poll (legacy — kept for backward compat) ─────────
-                if (statusName === 'cashapp' && guildCashappCookie && !sharedEmailCfg) {
-                  const orderRef = db.collection('orders').doc(shortOrderId);
-                  await orderRef.update({ status: 'pending_cashapp' });
-                  state.stripeInteraction = interaction;
-
-                  const pollerKey    = `cashapp:${interaction.user.id}:${interaction.guildId!}`;
-                  const pollerOrderId = shortOrderId;
-                  const pollerAmount  = state.totalPrice;
-
-                  stopPoller(cashappPollers, pollerKey);
-
-                  const runCashAppCheck = async () => {
-                    try {
-                      const confirmed = await checkCashAppPayment(pollerAmount, pollerOrderId, guildCashappCookie);
-                      if (confirmed) { stopPoller(cashappPollers, pollerKey); await fulfillOrder(pollerOrderId, true); return true; }
-                    } catch (err) { console.error('Cash App cookie poller error:', err); }
-                    return false;
-                  };
-
-                  const cashappAlreadyPaid = await runCashAppCheck();
-                  if (!cashappAlreadyPaid) {
-                    const cashappInterval = setInterval(runCashAppCheck, 15000);
-                    const cashappTimeout = setTimeout(() => {
-                      stopPoller(cashappPollers, pollerKey);
-                      // Alert admin that auto-verify expired without confirming
-                      const expiredWebhook = config.webhookUrl;
-                      if (expiredWebhook) {
-                        fetch(expiredWebhook, {
-                          method: 'POST', headers: { 'Content-Type': 'application/json' },
-                          body: JSON.stringify({ content: `⚠️ **Cash App auto-verify expired** for order \`${pollerOrderId}\` ($${pollerAmount.toFixed(2)}). No matching payment was detected after 30 minutes. Please verify manually with \`/admin_orders\`.` }),
-                        }).catch(() => {});
-                      }
-                    }, 30 * 60 * 1000);
-                    cashappPollers.set(pollerKey, { interval: cashappInterval, timeout: cashappTimeout });
-                  }
-                }
-
-                // ── Email-based auto-poll (Cash App, Venmo, Zelle, PayPal) ──────────
-                const emailProviders: string[] = ['cashapp', 'venmo', 'zelle', 'paypal'];
-                if (emailProviders.includes(statusName) && sharedEmailCfg) {
-                  const orderRef = db.collection('orders').doc(shortOrderId);
-                  await orderRef.update({ status: `pending_${statusName}` });
-                  state.stripeInteraction = interaction;
-
-                  const pollerKey    = `email:${statusName}:${interaction.user.id}:${interaction.guildId!}`;
-                  const pollerOrderId = shortOrderId;
-                  const pollerAmount  = state.totalPrice;
-                  const imapSnap      = { ...sharedEmailCfg };
-                  const provider      = statusName as import('./email-payments.ts').PaymentProvider;
-
-                  stopPoller(emailPaymentPollers, pollerKey);
-
-                  const runEmailCheck = async () => {
-                    try {
-                      const uid = await checkEmailPayment(provider, pollerAmount, pollerOrderId, imapSnap, 45, emailUsedUids);
-                      if (uid) {
-                        emailUsedUids.add(uid);
-                        stopPoller(emailPaymentPollers, pollerKey);
-                        await fulfillOrder(pollerOrderId, true);
-                        return true;
-                      }
-                    } catch (err) { console.error(`${statusName} email poller error:`, err); }
-                    return false;
-                  };
-
-                  // Immediate first check — don't make the user wait 20s
-                  const alreadyPaid = await runEmailCheck();
-                  if (!alreadyPaid) {
-                    const emailInterval = setInterval(runEmailCheck, 20000);
-                    const emailTimeout = setTimeout(() => {
-                      stopPoller(emailPaymentPollers, pollerKey);
-                      // Alert admin that auto-verify expired
-                      const expiredWebhook2 = config.webhookUrl;
-                      if (expiredWebhook2) {
-                        fetch(expiredWebhook2, {
-                          method: 'POST', headers: { 'Content-Type': 'application/json' },
-                          body: JSON.stringify({ content: `⚠️ **${statusName} email auto-verify expired** for order \`${pollerOrderId}\` ($${pollerAmount.toFixed(2)}). No matching payment email was found after 35 minutes. Please verify manually with \`/admin_orders\`.` }),
-                        }).catch(() => {});
-                      }
-                    }, 35 * 60 * 1000);
-                    emailPaymentPollers.set(pollerKey, { interval: emailInterval, timeout: emailTimeout });
-                  }
-                }
               } catch (err: any) {
                 console.error('Manual Payment Error:', err);
                 await interaction.followUp({ content: `❌ Error: ${err.message}`, flags: MessageFlags.Ephemeral });
               }
-            } else if (['cashapp_sent', 'venmo_sent', 'zelle_sent', 'crypto_sent', 'paypal_sent'].includes(interaction.customId)) {
+            } else if (['cashapp_sent', 'venmo_sent', 'zelle_sent', 'crypto_sent'].includes(interaction.customId)) {
               try {
                 await interaction.deferUpdate();
 
                 let statusName = interaction.customId.replace('_sent', '');
                 let paymentName = statusName === 'cashapp' ? 'Cash App' : statusName.charAt(0).toUpperCase() + statusName.slice(1);
 
+                const orderRef = db.collection('orders').doc(state.currentOrderId);
+                await orderRef.update({ status: `pending_${statusName}` });
+
                 const config = await getGuildConfig(interaction.guildId!) || {};
-                const guildCashappCookie2 = config.cashappCookie as string | undefined;
-                const hasEmailCfg = !!(config.paymentImapEmail && config.paymentImapPassword) || !!(config.zelleImapEmail && config.zelleImapPassword);
-                const willAutoPoll =
-                  (statusName === 'cashapp' && (!!guildCashappCookie2 || hasEmailCfg)) ||
-                  (statusName === 'zelle'   && hasEmailCfg) ||
-                  (statusName === 'venmo'   && hasEmailCfg) ||
-                  (statusName === 'paypal'  && hasEmailCfg);
-
-                // For manual methods (no auto-poll), update status now
-                if (!willAutoPoll) {
-                  const orderRef = db.collection('orders').doc(state.currentOrderId);
-                  await orderRef.update({ status: `pending_${statusName}` });
-                }
-
-                const autoPaymentName = statusName === 'cashapp' ? 'Cash App' : statusName === 'venmo' ? 'Venmo' : statusName === 'paypal' ? 'PayPal' : 'Zelle';
-                const embedDesc = willAutoPoll
-                  ? `Thank you! The bot is already watching for your ${autoPaymentName} payment and will confirm it automatically.\n\nOrder Number: \`${state.currentOrderId}\``
-                  : `Thank you! Your order is now awaiting manual verification.\n\nOnce the admin confirms receipt of your ${paymentName} payment with Order Number \`${state.currentOrderId}\`, your order will be sent to the kitchen and you will be notified.`;
-
                 const embed = createEmbed(config)
                   .setTitle('⏳ Payment Verification Pending')
-                  .setDescription(embedDesc);
+                  .setDescription(`Thank you! Your order is now awaiting manual verification.\n\nOnce the admin confirms receipt of your ${paymentName} payment with Order Number \`${state.currentOrderId}\`, your order will be sent to the kitchen and you will be notified.`);
 
-                const callStaffBtn = new ButtonBuilder()
-                  .setCustomId('call_staff')
-                  .setLabel('📣 Call for Staff')
-                  .setStyle(ButtonStyle.Secondary);
-                const pendingRow = new ActionRowBuilder<ButtonBuilder>().addComponents(callStaffBtn);
+                await interaction.editReply({ content: '', embeds: [embed], components: [] });
 
-                await interaction.editReply({ content: '', embeds: [embed], components: [pendingRow] });
-
-                // Update stored interaction so fulfillOrder updates this screen when payment is confirmed
+                // Store interaction so fulfillOrder can update the customer's screen on manual confirm
                 state.stripeInteraction = interaction;
 
-                // Kick off an immediate check now that the user has confirmed they sent payment
-                if (willAutoPoll) {
-                  const sentConfig = await getGuildConfig(interaction.guildId!) || {};
-                  const sentEmailCfg = (sentConfig.paymentImapEmail && sentConfig.paymentImapPassword)
-                    ? { email: sentConfig.paymentImapEmail as string, password: sentConfig.paymentImapPassword as string, host: sentConfig.paymentImapHost as string | undefined }
-                    : (sentConfig.zelleImapEmail && sentConfig.zelleImapPassword)
-                      ? { email: sentConfig.zelleImapEmail as string, password: sentConfig.zelleImapPassword as string, host: sentConfig.zelleImapHost as string | undefined }
-                      : null;
-                  if (sentEmailCfg && ['cashapp', 'venmo', 'zelle', 'paypal'].includes(statusName)) {
-                    const sentProvider = statusName as import('./email-payments.ts').PaymentProvider;
-                    checkEmailPayment(sentProvider, state.totalPrice, state.currentOrderId, sentEmailCfg, 90, emailUsedUids)
-                      .then(uid => {
-                        if (uid) { emailUsedUids.add(uid); fulfillOrder(state.currentOrderId, true); }
-                      })
-                      .catch(err => console.error(`${statusName} sent-button immediate check error:`, err));
-                  }
-                }
-
-                // For non-cashapp manual methods, alert admin
-                if (!willAutoPoll) {
-                  const guildWebhookUrl = config.webhookUrl;
-                  if (guildWebhookUrl) {
-                    await fetch(guildWebhookUrl, {
-                      method: 'POST',
-                      headers: { 'Content-Type': 'application/json' },
-                      body: JSON.stringify({ content: `🚨 **ACTION REQUIRED: ${paymentName} Payment Pending!** 🚨\n\n**Order ID:** \`${state.currentOrderId}\`\n**Amount:** $${state.totalPrice.toFixed(2)}\n**User:** <@${interaction.user.id}>\n\nPlease check your ${paymentName} for a payment with this Order ID in the notes. Use \`/admin_orders\` to confirm the payment and send the order to the kitchen.` })
-                    }).catch(err => console.error('Failed to send admin alert webhook:', err));
-                  }
+                // Alert Admin via per-guild webhook
+                const guildWebhookUrl = config.webhookUrl || process.env.DISCORD_WEBHOOK_URL;
+                if (guildWebhookUrl) {
+                  const payload = {
+                    content: `🚨 **ACTION REQUIRED: ${paymentName} Payment Pending!** 🚨\n\n**Order ID:** \`${state.currentOrderId}\`\n**Amount:** $${state.totalPrice.toFixed(2)}\n**User:** <@${interaction.user.id}>\n\nPlease check your ${paymentName} for a payment with this Order ID in the notes. Use \`/admin_orders\` to confirm the payment and send the order to the kitchen.`
+                  };
+                  await fetch(guildWebhookUrl, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload)
+                  }).catch(err => console.error('Failed to send admin alert webhook:', err));
                 }
 
               } catch (err: any) {
                 console.error('Payment Sent Error:', err);
                 await interaction.followUp({ content: `❌ Error: ${err.message}`, flags: MessageFlags.Ephemeral });
+              }
+            } else if (interaction.customId === 'refresh_link') {
+              if (!state.stripeSessionId) {
+                return await interaction.reply({ content: '❌ No active payment session found.', flags: MessageFlags.Ephemeral });
+              }
+
+              try {
+                await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+                const stripe = await getStripeForGuild(interaction.guildId!);
+                if (!stripe) {
+                  return await interaction.editReply({ content: '❌ Payment system is not configured.' });
+                }
+                const session = await stripe.checkout.sessions.retrieve(state.stripeSessionId);
+                
+                const payBtn = new ButtonBuilder().setLabel('Pay with Stripe').setStyle(ButtonStyle.Link).setURL(session.url!);
+                const checkBtn = new ButtonBuilder().setCustomId('check_payment').setLabel('Check Payment Status').setStyle(ButtonStyle.Primary);
+                const row = new ActionRowBuilder<ButtonBuilder>().addComponents(payBtn, checkBtn);
+
+                await interaction.editReply({ 
+                  content: `Here is your payment link again.`, 
+                  components: [row] 
+                });
+              } catch (err) {
+                console.error('Refresh Link Error:', err);
+                await interaction.editReply({ content: '❌ Error refreshing payment link. Please try again later.' });
               }
             } else if (interaction.customId === 'check_payment') {
               if (!state.currentOrderId) {
@@ -2884,302 +2317,70 @@ async function initDiscordBot() {
 
               try {
                 await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+                await interaction.editReply({ content: '💳 Verifying payment status...', components: [] });
+                await new Promise(resolve => setTimeout(resolve, 800));
+                
                 const orderId = state.currentOrderId;
+                const userId = interaction.user.id;
 
+                let isManuallyConfirmed = false;
                 const orderDoc = await db.collection('orders').doc(orderId).get();
                 const orderData = orderDoc.data();
-                const currentStatus = orderData?.status ?? '';
+                if (orderData?.status === 'paid' || orderData?.status === 'paid_fulfilled') {
+                  isManuallyConfirmed = true;
+                }
 
-                // Already fulfilled by admin or previous auto-check
-                const isAlreadyConfirmed = currentStatus === 'paid' || currentStatus === 'paid_fulfilled' || state.isFulfilled;
+                let isStripePaid = false;
+                let sessionUrl = null;
+                if (state.stripeSessionId) {
+                  try {
+                    const stripe = await getStripeForGuild(interaction.guildId!);
+                    if (stripe) {
+                      const session = await stripe.checkout.sessions.retrieve(state.stripeSessionId);
+                      sessionUrl = session.url;
+                      if (session.status === 'complete' && session.payment_status === 'paid') {
+                        isStripePaid = true;
+                      }
+                    }
+                  } catch (e) {
+                    console.error('Error retrieving stripe session:', e);
+                  }
+                }
 
-                if (isAlreadyConfirmed) {
+                if (state.isFulfilled || isManuallyConfirmed || isStripePaid) {
+                  await interaction.editReply({ content: '✅ Payment Confirmed! Sending order to kitchen...', components: [] });
+                  await new Promise(resolve => setTimeout(resolve, 800));
+                  
                   const success = await fulfillOrder(orderId, false);
                   if (success) {
                     const config = await getGuildConfig(interaction.guildId!) || {};
                     const successMsg = config.successMessage || 'Your order has been sent to the kitchen.';
+                    
                     const parsedOrders = safeParseOrders(orderData?.orderData);
                     const orderDetails = formatOrderItems(parsedOrders);
+
                     const successEmbed = createEmbed(config)
                       .setTitle('🎉 Order Successful!')
                       .setDescription(`${successMsg}\n\n**Your Order Details:**\n${orderDetails}`)
                       .setImage('https://media.giphy.com/media/l0HlUxcWRsqROFAHQ/giphy.gif');
-                    return await interaction.editReply({ content: '', embeds: [successEmbed], components: [] });
+                      
+                    await interaction.editReply({ content: '', embeds: [successEmbed], components: [] });
                   } else {
-                    return await interaction.editReply({ content: '❌ Payment confirmed, but there was an error processing your order. Please contact support.', embeds: [] });
+                    await interaction.editReply({ content: '❌ Payment confirmed, but there was an error processing your order. Please contact support.', embeds: [] });
                   }
-                }
-
-                // Actively re-poll the payment provider on button press
-                // This handles the case where the poller has expired or the user just sent payment
-                const checkConfig = await getGuildConfig(interaction.guildId!) || {};
-                const checkEmailCfg = (checkConfig.paymentImapEmail && checkConfig.paymentImapPassword)
-                  ? { email: checkConfig.paymentImapEmail as string, password: checkConfig.paymentImapPassword as string, host: checkConfig.paymentImapHost as string | undefined }
-                  : (checkConfig.zelleImapEmail && checkConfig.zelleImapPassword)
-                    ? { email: checkConfig.zelleImapEmail as string, password: checkConfig.zelleImapPassword as string, host: checkConfig.zelleImapHost as string | undefined }
-                    : null;
-                const checkCashappCookie = checkConfig.cashappCookie as string | undefined;
-
-                let activelyFound = false;
-
-                // Determine which provider this order is waiting on
-                const emailProviderMap: Record<string, import('./email-payments.ts').PaymentProvider> = {
-                  pending_cashapp: 'cashapp',
-                  pending_venmo: 'venmo',
-                  pending_zelle: 'zelle',
-                  pending_paypal: 'paypal',
-                };
-                const emailProvider = emailProviderMap[currentStatus];
-
-                if (emailProvider && checkEmailCfg) {
-                  try {
-                    const uid = await checkEmailPayment(emailProvider, state.totalPrice, orderId, checkEmailCfg, 90, emailUsedUids);
-                    if (uid) { emailUsedUids.add(uid); activelyFound = true; }
-                  } catch (err) { console.error('check_payment email re-poll error:', err); }
-                } else if (currentStatus === 'pending_cashapp' && checkCashappCookie) {
-                  try {
-                    activelyFound = await checkCashAppPayment(state.totalPrice, orderId, checkCashappCookie);
-                  } catch (err) { console.error('check_payment cashapp re-poll error:', err); }
-                }
-
-                if (activelyFound) {
-                  const fulfilled = await fulfillOrder(orderId, true);
-                  if (fulfilled) {
-                    const config = await getGuildConfig(interaction.guildId!) || {};
-                    const successMsg = config.successMessage || 'Your order has been sent to the kitchen.';
-                    const parsedOrders = safeParseOrders(orderData?.orderData);
-                    const orderDetails = formatOrderItems(parsedOrders);
-                    const successEmbed = createEmbed(config)
-                      .setTitle('🎉 Order Successful!')
-                      .setDescription(`${successMsg}\n\n**Your Order Details:**\n${orderDetails}`)
-                      .setImage('https://media.giphy.com/media/l0HlUxcWRsqROFAHQ/giphy.gif');
-                    return await interaction.editReply({ content: '', embeds: [successEmbed], components: [] });
+                } else {
+                  const components = [];
+                  if (sessionUrl) {
+                    const payBtn = new ButtonBuilder().setLabel('Pay with Stripe').setStyle(ButtonStyle.Link).setURL(sessionUrl);
+                    const row = new ActionRowBuilder<ButtonBuilder>().addComponents(payBtn);
+                    components.push(row);
                   }
+                  await interaction.editReply({ content: '❌ Payment not yet confirmed. If you used Cash App, please wait for an admin to verify your payment.', components, embeds: [] });
                 }
-
-                const providerLabel = emailProvider
-                  ? emailProvider.charAt(0).toUpperCase() + emailProvider.slice(1)
-                  : currentStatus.includes('cashapp') ? 'Cash App' : 'the payment provider';
-                await interaction.editReply({
-                  content: `⏳ Payment not yet detected. Make sure you included \`${orderId}\` in the payment notes and try again in a moment. If the issue persists, ask staff for help.`,
-                  components: [],
-                  embeds: [],
-                });
               } catch (err) {
                 console.error('Check Payment Error:', err);
                 await interaction.editReply({ content: '❌ Error checking payment status. Please try again later.' });
               }
-            } else if (interaction.customId === 'call_staff') {
-              try {
-                await interaction.deferReply({ flags: MessageFlags.Ephemeral });
-
-                // Rate-limit: one ping per order per 2 minutes
-                const now = Date.now();
-                const lastCall = (state as any).lastStaffCall ?? 0;
-                const cooldownMs = 2 * 60 * 1000;
-                if (now - lastCall < cooldownMs) {
-                  const secsLeft = Math.ceil((cooldownMs - (now - lastCall)) / 1000);
-                  return await interaction.editReply({ content: `⏳ Staff was already notified. Please wait ${secsLeft}s before calling again.` });
-                }
-                (state as any).lastStaffCall = now;
-
-                const config = await getGuildConfig(interaction.guildId!) || {};
-                const guildWebhookUrl = config.webhookUrl;
-                const staffPing = config.staffRoleId ? `<@&${config.staffRoleId}> ` : '';
-
-                if (guildWebhookUrl) {
-                  const orderId = state.currentOrderId;
-                  await fetch(guildWebhookUrl, {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({
-                      content: `${staffPing}📣 **Staff assistance requested!**\n\n**User:** <@${interaction.user.id}>\n**Order ID:** \`${orderId}\`\n\nThe customer is waiting for manual payment verification. Use \`/admin_orders\` to confirm.`
-                    })
-                  }).catch(err => console.error('Failed to send staff ping webhook:', err));
-                  await interaction.editReply({ content: '✅ Staff has been notified! Someone will assist you shortly.' });
-                } else {
-                  await interaction.editReply({ content: '❌ No webhook is configured — staff cannot be alerted automatically. Please contact an admin directly.' });
-                }
-              } catch (err: any) {
-                console.error('Call Staff Error:', err);
-                await interaction.editReply({ content: '❌ Something went wrong. Please contact an admin directly.' });
-              }
-            } else if (interaction.customId.startsWith('deposit_pay_')) {
-              // Deposit: user selected payment method
-              try {
-                await interaction.deferUpdate();
-                const method = interaction.customId.replace('deposit_pay_', '') as 'cashapp' | 'venmo' | 'zelle' | 'paypal';
-                state.pendingDepositMethod = method;
-                const depositId = (state as any).pendingDepositId;
-                const depositAmount: number = (state as any).pendingDepositAmount;
-                if (!depositId || !depositAmount) return await interaction.followUp({ content: '❌ Deposit session expired. Run `/deposit` again.', flags: MessageFlags.Ephemeral });
-
-                const config = await getGuildConfig(interaction.guildId!) || {};
-                let payInfo = '';
-                if (method === 'cashapp' && config.cashappTag) payInfo = `**${config.cashappTag}** on Cash App`;
-                else if (method === 'venmo' && config.venmoHandle) payInfo = `**${config.venmoHandle}** on Venmo`;
-                else if (method === 'zelle' && config.zelleEmail) payInfo = `**${config.zelleEmail}** on Zelle`;
-                else if (method === 'paypal' && config.paypalEmail) payInfo = `**${config.paypalEmail}** on PayPal`;
-                else return await interaction.followUp({ content: `❌ ${method} is not configured on this server.`, flags: MessageFlags.Ephemeral });
-
-                const sentBtn = new ButtonBuilder().setCustomId('deposit_sent').setLabel('✅ I Sent the Payment').setStyle(ButtonStyle.Success);
-                const embed = createEmbed(config)
-                  .setTitle('💳 Deposit — Send Payment')
-                  .setDescription(`Send **$${depositAmount.toFixed(2)}** to ${payInfo}.\n\n**IMPORTANT:** Include this exact Deposit ID in the notes/memo:\n\`\`\`${depositId}\`\`\`\nOnce sent, click the button below. Your wallet will be credited automatically when the payment is detected.`);
-                await interaction.editReply({ content: '', embeds: [embed], components: [new ActionRowBuilder<ButtonBuilder>().addComponents(sentBtn)] });
-              } catch (err: any) {
-                console.error('deposit_pay error:', err);
-                await interaction.followUp({ content: `❌ ${err.message}`, flags: MessageFlags.Ephemeral });
-              }
-
-            } else if (interaction.customId === 'deposit_sent') {
-              // Deposit: user confirmed they sent payment — start polling
-              try {
-                await interaction.deferUpdate();
-                const depositId: string = (state as any).pendingDepositId;
-                const depositAmount: number = (state as any).pendingDepositAmount;
-                const depositMethod: string = (state as any).pendingDepositMethod || 'cashapp';
-                if (!depositId || !depositAmount) return await interaction.followUp({ content: '❌ Deposit session expired. Run `/deposit` again.', flags: MessageFlags.Ephemeral });
-
-                const config = await getGuildConfig(interaction.guildId!) || {};
-                const emailCfg = (config.paymentImapEmail && config.paymentImapPassword)
-                  ? { email: config.paymentImapEmail as string, password: config.paymentImapPassword as string, host: config.paymentImapHost as string | undefined }
-                  : (config.zelleImapEmail && config.zelleImapPassword)
-                    ? { email: config.zelleImapEmail as string, password: config.zelleImapPassword as string, host: config.zelleImapHost as string | undefined }
-                    : null;
-                const cashappCookie = config.cashappCookie as string | undefined;
-
-                // Save pending deposit to Firestore
-                const depositRef = db.collection('guilds').doc(interaction.guildId!).collection('deposits').doc(depositId);
-                await depositRef.set({
-                  userId: interaction.user.id,
-                  guildId: interaction.guildId,
-                  amount: depositAmount,
-                  method: depositMethod,
-                  status: 'pending',
-                  createdAt: serverTimestamp(),
-                });
-
-                const stopDepositPoller = (key: string) => {
-                  const p = depositPollers.get(key);
-                  if (p) { clearInterval(p.interval); clearTimeout(p.timeout); depositPollers.delete(key); }
-                };
-
-                const creditWallet = async () => {
-                  const customerRef = db.collection('guilds').doc(interaction.guildId!).collection('customers').doc(interaction.user.id);
-                  await db.runTransaction(async (txn) => {
-                    const doc = await txn.get(customerRef);
-                    const bal: number = doc.exists ? (doc.data()?.creditBalance || 0) : 0;
-                    const newBal = Math.round((bal + depositAmount) * 100) / 100;
-                    txn.set(customerRef, { userId: interaction.user.id, creditBalance: newBal, lastCreditReason: `Deposit ${depositId}`, lastCreditAdjustment: serverTimestamp() }, { merge: true });
-                  });
-                  await depositRef.update({ status: 'confirmed' });
-                  // Notify user
-                  try {
-                    const customerDoc2 = await db.collection('guilds').doc(interaction.guildId!).collection('customers').doc(interaction.user.id).get();
-                    const finalBal: number = customerDoc2.data()?.creditBalance || 0;
-                    const dm = await interaction.user.createDM();
-                    await dm.send(`✅ **${interaction.guild?.name}**: Your deposit of **$${depositAmount.toFixed(2)}** was confirmed! Your wallet balance is now **$${finalBal.toFixed(2)}**.`);
-                  } catch {}
-                };
-
-                const pollerKey = `deposit:${interaction.user.id}:${interaction.guildId}`;
-                stopDepositPoller(pollerKey);
-
-                const runDepositCheck = async (): Promise<boolean> => {
-                  try {
-                    const provider = depositMethod as import('./email-payments.ts').PaymentProvider;
-                    if (emailCfg && ['cashapp', 'venmo', 'zelle', 'paypal'].includes(depositMethod)) {
-                      const uid = await checkEmailPayment(provider, depositAmount, depositId, emailCfg, 90, emailUsedUids);
-                      if (uid) { emailUsedUids.add(uid); stopDepositPoller(pollerKey); await creditWallet(); return true; }
-                    } else if (depositMethod === 'cashapp' && cashappCookie) {
-                      const found = await checkCashAppPayment(depositAmount, depositId, cashappCookie);
-                      if (found) { stopDepositPoller(pollerKey); await creditWallet(); return true; }
-                    }
-                  } catch (err) { console.error('deposit poller error:', err); }
-                  return false;
-                };
-
-                const alreadyPaid = await runDepositCheck();
-                if (!alreadyPaid) {
-                  const interval = setInterval(runDepositCheck, 20000);
-                  const timeout = setTimeout(() => {
-                    stopDepositPoller(pollerKey);
-                    depositRef.update({ status: 'expired' }).catch(() => {});
-                    const wh = config.webhookUrl as string | undefined;
-                    if (wh) fetch(wh, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ content: `⚠️ Deposit \`${depositId}\` ($${depositAmount.toFixed(2)}) by <@${interaction.user.id}> expired without payment detected.` }) }).catch(() => {});
-                  }, 35 * 60 * 1000);
-                  depositPollers.set(pollerKey, { interval, timeout });
-                }
-
-                const checkBtn = new ButtonBuilder().setCustomId('deposit_check').setLabel('🔍 Check Payment').setStyle(ButtonStyle.Secondary);
-                const embed2 = createEmbed(config)
-                  .setTitle('⏳ Deposit Pending Verification')
-                  .setDescription(`The bot is watching for your **$${depositAmount.toFixed(2)}** payment.\n\n**Deposit ID:** \`${depositId}\`\n\nYour wallet will be credited automatically once the payment is detected. This usually takes under a minute.`);
-                await interaction.editReply({ content: '', embeds: [embed2], components: [new ActionRowBuilder<ButtonBuilder>().addComponents(checkBtn)] });
-              } catch (err: any) {
-                console.error('deposit_sent error:', err);
-                await interaction.followUp({ content: `❌ ${err.message}`, flags: MessageFlags.Ephemeral });
-              }
-
-            } else if (interaction.customId === 'deposit_check') {
-              // Deposit: user manually re-checks payment
-              try {
-                await interaction.deferReply({ flags: MessageFlags.Ephemeral });
-                const depositId: string = (state as any).pendingDepositId;
-                const depositAmount: number = (state as any).pendingDepositAmount;
-                const depositMethod: string = (state as any).pendingDepositMethod || 'cashapp';
-                if (!depositId) return await interaction.editReply({ content: '❌ Deposit session expired. Run `/deposit` again.' });
-
-                // Check Firestore status first
-                const depositRef2 = db.collection('guilds').doc(interaction.guildId!).collection('deposits').doc(depositId);
-                const depositDoc = await depositRef2.get();
-                if (depositDoc.data()?.status === 'confirmed') {
-                  const cdoc = await db.collection('guilds').doc(interaction.guildId!).collection('customers').doc(interaction.user.id).get();
-                  const bal: number = cdoc.data()?.creditBalance || 0;
-                  return await interaction.editReply({ content: `✅ Payment already confirmed! Your wallet balance is **$${bal.toFixed(2)}**.` });
-                }
-
-                const config2 = await getGuildConfig(interaction.guildId!) || {};
-                const emailCfg2 = (config2.paymentImapEmail && config2.paymentImapPassword)
-                  ? { email: config2.paymentImapEmail as string, password: config2.paymentImapPassword as string, host: config2.paymentImapHost as string | undefined }
-                  : (config2.zelleImapEmail && config2.zelleImapPassword)
-                    ? { email: config2.zelleImapEmail as string, password: config2.zelleImapPassword as string, host: config2.zelleImapHost as string | undefined }
-                    : null;
-                const cashappCookie2 = config2.cashappCookie as string | undefined;
-                let found2 = false;
-                const provider2 = depositMethod as import('./email-payments.ts').PaymentProvider;
-
-                if (emailCfg2 && ['cashapp', 'venmo', 'zelle', 'paypal'].includes(depositMethod)) {
-                  const uid2 = await checkEmailPayment(provider2, depositAmount, depositId, emailCfg2, 90, emailUsedUids).catch(() => null);
-                  if (uid2) { emailUsedUids.add(uid2); found2 = true; }
-                } else if (depositMethod === 'cashapp' && cashappCookie2) {
-                  found2 = await checkCashAppPayment(depositAmount, depositId, cashappCookie2).catch(() => false);
-                }
-
-                if (found2) {
-                  // Credit wallet
-                  const customerRef2 = db.collection('guilds').doc(interaction.guildId!).collection('customers').doc(interaction.user.id);
-                  await db.runTransaction(async (txn) => {
-                    const d = await txn.get(customerRef2);
-                    const b: number = d.exists ? (d.data()?.creditBalance || 0) : 0;
-                    txn.set(customerRef2, { userId: interaction.user.id, creditBalance: Math.round((b + depositAmount) * 100) / 100, lastCreditReason: `Deposit ${depositId}`, lastCreditAdjustment: serverTimestamp() }, { merge: true });
-                  });
-                  await depositRef2.update({ status: 'confirmed' });
-                  const pollerKey2 = `deposit:${interaction.user.id}:${interaction.guildId}`;
-                  const p2 = depositPollers.get(pollerKey2);
-                  if (p2) { clearInterval(p2.interval); clearTimeout(p2.timeout); depositPollers.delete(pollerKey2); }
-                  const cdoc2 = await db.collection('guilds').doc(interaction.guildId!).collection('customers').doc(interaction.user.id).get();
-                  const finalBal2: number = cdoc2.data()?.creditBalance || 0;
-                  await interaction.editReply({ content: `✅ Payment detected! **$${depositAmount.toFixed(2)}** added to your wallet. New balance: **$${finalBal2.toFixed(2)}**.` });
-                } else {
-                  await interaction.editReply({ content: `⏳ Payment not yet detected. Make sure you included \`${depositId}\` in the payment notes and try again shortly.` });
-                }
-              } catch (err: any) {
-                console.error('deposit_check error:', err);
-                await interaction.editReply({ content: `❌ ${err.message}` });
-              }
-
             } else if (interaction.customId === 'back_to_review') {
               if (state.editingIndex !== null && state.editingIndex !== undefined) {
                 state.orders.splice(state.editingIndex, 0, state.currentOrder);
@@ -3233,86 +2434,91 @@ async function initDiscordBot() {
   }
 }
 
-// ─── Cash App browser auto-capture ───────────────────────────────────────────
-
-function findChromePath(): string | null {
-  const candidates = [
-    '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
-    '/Applications/Chromium.app/Contents/MacOS/Chromium',
-    '/Applications/Google Chrome Canary.app/Contents/MacOS/Google Chrome Canary',
-    '/Applications/Brave Browser.app/Contents/MacOS/Brave Browser',
-    '/usr/bin/google-chrome',
-    '/usr/bin/google-chrome-stable',
-    '/usr/bin/chromium-browser',
-    '/usr/bin/chromium',
-  ];
-  for (const p of candidates) {
-    if (fs.existsSync(p)) return p;
-  }
-  return null;
-}
-
-async function captureCashAppCookieViaBrowser(): Promise<string | null> {
-  const chromePath = findChromePath();
-  if (!chromePath) return null;
-
-  const browser = await puppeteer.launch({
-    executablePath: chromePath,
-    headless: false,
-    args: [
-      '--no-sandbox',
-      '--disable-setuid-sandbox',
-      '--window-size=480,720',
-      '--window-position=100,100',
-    ],
-    defaultViewport: null,
-  });
-
-  const [page] = await browser.pages();
-  await page.goto('https://cash.app/login', { waitUntil: 'domcontentloaded' });
-
-  // Add a status banner so the admin knows what this window is for
-  await page.evaluate(() => {
-    const bar = document.createElement('div');
-    bar.style.cssText = 'position:fixed;top:0;left:0;right:0;z-index:99999;background:#6d28d9;color:#fff;font-size:13px;font-family:system-ui,sans-serif;padding:8px 12px;text-align:center';
-    bar.textContent = '🌯 Burrito Bot — Log in to Cash App. The window will close automatically.';
-    document.body.prepend(bar);
-  }).catch(() => {});
-
-  return new Promise((resolve) => {
-    const POLL_MS = 5000;
-    const TIMEOUT_MS = 5 * 60 * 1000;
-    const started = Date.now();
-
-    const poll = setInterval(async () => {
-      try {
-        if (!browser.connected) { clearInterval(poll); resolve(null); return; }
-        if (Date.now() - started > TIMEOUT_MS) { clearInterval(poll); await browser.close().catch(() => {}); resolve(null); return; }
-
-        const cookies = await page.cookies('https://cash.app');
-        const match = cookies.find(c => c.name === 'cash_web_session');
-        if (match) {
-          clearInterval(poll);
-          // Show success banner before closing
-          await page.evaluate(() => {
-            const bar = document.querySelector('div[style*="6d28d9"]') as HTMLElement | null;
-            if (bar) { bar.style.background = '#059669'; bar.textContent = '✅ Logged in! Closing window…'; }
-          }).catch(() => {});
-          setTimeout(() => browser.close().catch(() => {}), 1800);
-          resolve(match.value);
-        }
-      } catch { /* page may be navigating */ }
-    }, POLL_MS);
-
-    browser.on('disconnected', () => { clearInterval(poll); resolve(null); });
-  });
-}
-
 async function startServer() {
   const app = express();
   const PORT = 3000;
 
-  // Apply JSON body parser for all routes
+  // IMPORTANT: Stripe webhook must be registered BEFORE express.json()
+  // so the raw body is preserved for signature verification.
+  app.post('/stripe-webhook', express.raw({ type: 'application/json' }), async (req, res) => {
+    console.log('--- Webhook Received ---');
+    const sig = req.headers['stripe-signature'];
+
+    let event: any;
+
+    try {
+      if (sig) {
+        // Parse body to look up the guild's per-server Stripe credentials
+        let parsedBody: any;
+        try { parsedBody = JSON.parse(req.body.toString()); } catch { return res.status(400).send('Invalid JSON.'); }
+
+        const orderId = parsedBody?.data?.object?.metadata?.orderId;
+        let webhookSecret: string | undefined;
+        let stripeKey: string | undefined;
+
+        if (orderId) {
+          try {
+            const orderDoc = await db.collection('orders').doc(orderId).get();
+            const guildId = orderDoc.data()?.guildId;
+            if (guildId) {
+              const guildCfg = await getGuildConfig(guildId) || {};
+              webhookSecret = guildCfg.stripeWebhookSecret;
+              stripeKey = guildCfg.stripeSecretKey;
+            }
+          } catch (e) { /* fall through */ }
+        }
+
+        if (webhookSecret && stripeKey) {
+          const verifier = new Stripe(stripeKey, { apiVersion: '2026-02-25.clover' });
+          event = verifier.webhooks.constructEvent(req.body, sig, webhookSecret);
+          console.log('Webhook signature verified.');
+        } else {
+          console.error('❌ No per-guild Stripe webhook secret configured — rejecting unverified event.');
+          return res.status(400).send('Webhook Error: No webhook secret configured. Admin must run /admin_setup to configure Stripe for this server.');
+        }
+      } else {
+        console.error('❌ No Stripe-Signature header — rejecting webhook.');
+        return res.status(400).send('Webhook Error: Missing Stripe-Signature header.');
+      }
+    } catch (err: any) {
+      console.error(`Webhook Signature Verification Failed: ${err.message}`);
+      return res.status(400).send(`Webhook Error: Invalid signature or payload.`);
+    }
+
+    console.log(`Event Type: ${event.type}`);
+
+    try {
+      if (event.type === 'checkout.session.completed') {
+        const session = event.data.object as Stripe.Checkout.Session;
+        const orderId = session.metadata?.orderId;
+
+        console.log(`Processing order ID: ${orderId}`);
+
+        if (orderId) {
+          const success = await fulfillOrder(orderId);
+          if (success) {
+            console.log(`Order ${orderId} fulfilled successfully via webhook.`);
+          } else {
+            console.error(`Failed to fulfill order ${orderId} via webhook. Discord notification or database update may have failed.`);
+            // Return 500 to tell Stripe to retry
+            return res.status(500).send('Failed to fulfill order. Please retry.');
+          }
+        } else {
+          console.error('Missing orderId in session metadata. Cannot fulfill order.');
+          return res.status(400).send('Missing orderId in session metadata.');
+        }
+      } else {
+        console.log(`Unhandled event type: ${event.type}`);
+      }
+    } catch (err: any) {
+      console.error(`Error processing webhook event ${event.type}:`, err);
+      return res.status(500).send(`Webhook Processing Error: ${err.message}`);
+    }
+
+    res.json({ received: true });
+  });
+
+  // Now apply JSON body parser for all other routes
   app.use(express.json());
 
   // API routes
@@ -3326,75 +2532,35 @@ async function startServer() {
       const nowPST = new Date(new Date().toLocaleString('en-US', { timeZone: 'America/Los_Angeles' }));
       const startOfDay = new Date(nowPST.getFullYear(), nowPST.getMonth(), nowPST.getDate(), 0, 0, 0);
 
-      // Today's orders, all-time paid, and recent 15 — fetched in parallel
-      const [todaySnap, allSnap, recentSnap] = await Promise.all([
-        db.collection('orders').where('createdAt', '>=', startOfDay).get(),
-        db.collection('orders').where('status', 'in', ['paid', 'paid_fulfilled']).get(),
-        db.collection('orders').orderBy('createdAt', 'desc').limit(15).get(),
-      ]);
+      // Today's orders
+      const todaySnap = await db.collection('orders').where('createdAt', '>=', startOfDay).get();
       let todayRevenue = 0;
       let todayEntrees = 0;
-      let todayPendingCount = 0;
-      let todayPendingRevenue = 0;
-      let todayFulfilledCount = 0;
-      const statusBreakdown: Record<string, number> = {};
-      const topItemsMap: Record<string, number> = {};
-
       todaySnap.docs.forEach(doc => {
         const d = doc.data();
-        const status = d.status || 'pending';
         if (d.totalPrice) todayRevenue += d.totalPrice;
         const items = safeParseOrders(d.orderData);
         todayEntrees += items.length;
-        statusBreakdown[status] = (statusBreakdown[status] || 0) + 1;
-        if (status.startsWith('pending')) {
-          todayPendingCount++;
-          todayPendingRevenue += d.totalPrice || 0;
-        }
-        if (status === 'paid_fulfilled') todayFulfilledCount++;
-        items.forEach((item: any) => {
-          const name = item.type || 'Unknown';
-          topItemsMap[name] = (topItemsMap[name] || 0) + 1;
-        });
       });
-
-      const topItems = Object.entries(topItemsMap)
-        .sort((a, b) => b[1] - a[1])
-        .slice(0, 6)
-        .map(([name, count]) => ({ name, count }));
-
-      const proteinMap: Record<string, number> = {};
-      todaySnap.docs.forEach(doc => {
-        const items = safeParseOrders(doc.data().orderData);
-        items.forEach((item: any) => {
-          (item.proteins || []).forEach((p: string) => {
-            proteinMap[p] = (proteinMap[p] || 0) + 1;
-          });
-        });
-      });
-      const topProteins = Object.entries(proteinMap)
-        .sort((a, b) => b[1] - a[1])
-        .slice(0, 8)
-        .map(([name, count]) => ({ name, count }));
 
       // All-time
+      const allSnap = await db.collection('orders').where('status', 'in', ['paid', 'paid_fulfilled']).get();
       let allRevenue = 0;
       allSnap.docs.forEach(doc => {
         const d = doc.data();
         if (d.totalPrice) allRevenue += d.totalPrice;
       });
+
+      // Recent 8 orders
+      const recentSnap = await db.collection('orders').orderBy('createdAt', 'desc').limit(8).get();
       const recentOrders = recentSnap.docs.map(doc => {
         const d = doc.data();
         const items = safeParseOrders(d.orderData);
-        const info = safeParseUserInfo(d.userInfo);
-        const guildName = d.guildId ? (client.guilds.cache.get(d.guildId)?.name || null) : null;
         return {
           id: doc.id.slice(0, 8),
           status: d.status || 'pending',
           total: d.totalPrice || 0,
           items: items.map((i: any) => i.type).join(', ') || 'Unknown',
-          name: info?.name || null,
-          guildName,
           createdAt: d.createdAt?.toDate().toISOString() || null,
           guildId: d.guildId || null,
         };
@@ -3415,514 +2581,17 @@ async function startServer() {
           orders: todaySnap.size,
           revenue: todayRevenue,
           entrees: todayEntrees,
-          pendingCount: todayPendingCount,
-          pendingRevenue: todayPendingRevenue,
-          fulfilledCount: todayFulfilledCount,
-          avgOrderValue: todaySnap.size > 0 ? todayRevenue / todaySnap.size : 0,
-          statusBreakdown,
         },
         allTime: {
           orders: allSnap.size,
           revenue: allRevenue,
-          avgOrderValue: allSnap.size > 0 ? allRevenue / allSnap.size : 0,
         },
-        topItems,
-        topProteins,
         recentOrders,
         timestamp: new Date().toISOString(),
       });
     } catch (err) {
       console.error('Dashboard API error:', err);
       res.status(500).json({ error: 'Failed to load dashboard data' });
-    }
-  });
-
-  // Pending orders
-  app.get('/api/dashboard/pending', async (req, res) => {
-    try {
-      const snap = await db.collection('orders')
-        .where('status', 'in', ['pending', 'pending_venmo', 'pending_cashapp', 'pending_zelle', 'pending_crypto', 'pending_paypal'])
-        .orderBy('createdAt', 'desc')
-        .limit(50)
-        .get();
-      const orders = snap.docs.map(doc => {
-        const d = doc.data();
-        const items = safeParseOrders(d.orderData);
-        const info = safeParseUserInfo(d.userInfo);
-        const guildName = d.guildId ? (client.guilds.cache.get(d.guildId)?.name || null) : null;
-        return {
-          id: doc.id,
-          shortId: doc.id.slice(0, 8),
-          status: d.status || 'pending',
-          total: d.totalPrice || 0,
-          items: items.map((i: any) => `${i.type}${i.proteins?.length ? ` (${i.proteins.join(', ')})` : ''}`).join(' · ') || 'Unknown',
-          name: info?.name || null,
-          phone: info?.phone || null,
-          email: info?.email || null,
-          location: info?.location || null,
-          time: info?.time || null,
-          guildName,
-          guildId: d.guildId || null,
-          createdAt: d.createdAt?.toDate().toISOString() || null,
-        };
-      });
-      res.json({ orders });
-    } catch (err) {
-      console.error('Pending orders API error:', err);
-      res.status(500).json({ error: 'Failed to load pending orders' });
-    }
-  });
-
-  // Fulfill order from dashboard
-  app.post('/api/dashboard/orders/:id/fulfill', async (req, res) => {
-    try {
-      const success = await fulfillOrder(req.params.id);
-      if (success) res.json({ ok: true });
-      else res.status(500).json({ error: 'Failed to fulfill order' });
-    } catch (err: any) {
-      res.status(500).json({ error: err.message });
-    }
-  });
-
-  // Cancel order from dashboard
-  app.post('/api/dashboard/orders/:id/cancel', async (req, res) => {
-    try {
-      await db.collection('orders').doc(req.params.id).update({ status: 'cancelled' });
-      res.json({ ok: true });
-    } catch (err: any) {
-      res.status(500).json({ error: err.message });
-    }
-  });
-
-  // 7-day revenue trend
-  app.get('/api/dashboard/trend', async (req, res) => {
-    try {
-      const days: { date: string; label: string; orders: number; revenue: number }[] = [];
-      for (let i = 6; i >= 0; i--) {
-        const base = new Date(new Date().toLocaleString('en-US', { timeZone: 'America/Los_Angeles' }));
-        base.setHours(0, 0, 0, 0);
-        base.setDate(base.getDate() - i);
-        const end = new Date(base);
-        end.setHours(23, 59, 59, 999);
-        const snap = await db.collection('orders').where('createdAt', '>=', base).where('createdAt', '<=', end).get();
-        let revenue = 0;
-        snap.docs.forEach(doc => { const d = doc.data(); if (d.totalPrice) revenue += d.totalPrice; });
-        days.push({
-          date: base.toISOString(),
-          label: base.toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric' }),
-          orders: snap.size,
-          revenue,
-        });
-      }
-      res.json({ days });
-    } catch (err) {
-      res.status(500).json({ error: 'Failed to load trend data' });
-    }
-  });
-
-  // Per-server stats
-  app.get('/api/dashboard/servers', async (req, res) => {
-    try {
-      const snap = await db.collection('orders').get();
-      const serverMap: Record<string, { guildId: string; orders: number; revenue: number; pending: number; fulfilled: number }> = {};
-      snap.docs.forEach(doc => {
-        const d = doc.data();
-        const gid = d.guildId;
-        if (!gid) return;
-        if (!serverMap[gid]) serverMap[gid] = { guildId: gid, orders: 0, revenue: 0, pending: 0, fulfilled: 0 };
-        serverMap[gid].orders++;
-        serverMap[gid].revenue += d.totalPrice || 0;
-        if ((d.status || '').startsWith('pending')) serverMap[gid].pending++;
-        if (d.status === 'paid_fulfilled') serverMap[gid].fulfilled++;
-      });
-      const servers = await Promise.all(
-        Object.values(serverMap).map(async s => {
-          const guild = client.guilds.cache.get(s.guildId);
-          const config = await getGuildConfig(s.guildId) || {};
-          return {
-            ...s,
-            name: guild?.name || s.guildId,
-            memberCount: guild?.memberCount ?? null,
-            storeOpen: config.storeOpen !== false,
-          };
-        })
-      );
-      servers.sort((a, b) => b.orders - a.orders);
-      res.json({ servers });
-    } catch (err) {
-      res.status(500).json({ error: 'Failed to load server stats' });
-    }
-  });
-
-  // Toggle store open/close
-  app.post('/api/dashboard/servers/:guildId/toggle', async (req, res) => {
-    try {
-      const { guildId } = req.params;
-      const config = await getGuildConfig(guildId) || {};
-      const newOpen = config.storeOpen === false ? true : false;
-      await updateGuildConfig(guildId, { ...config, storeOpen: newOpen });
-      res.json({ storeOpen: newOpen });
-    } catch (err: any) {
-      res.status(500).json({ error: err.message });
-    }
-  });
-
-  // Fulfill all paid orders for a guild (mirrors /fulfillall Discord command)
-  app.post('/api/dashboard/servers/:guildId/fulfillall', async (req, res) => {
-    try {
-      const { guildId } = req.params;
-      const snap = await db.collection('orders').where('status', '==', 'paid').where('guildId', '==', guildId).get();
-      if (snap.empty) return res.json({ fulfilled: 0 });
-      let count = 0;
-      for (const doc of snap.docs) {
-        const d = doc.data();
-        await db.collection('orders').doc(doc.id).update({ status: 'paid_fulfilled' });
-        count++;
-        // Notify the customer via DM
-        if (d.userId) {
-          try {
-            const user = await client.users.fetch(d.userId);
-            await user.send('✅ Your Chipotle order has been fulfilled and is on its way!');
-          } catch { /* DM failed — user may have DMs off */ }
-        }
-      }
-      res.json({ fulfilled: count });
-    } catch (err: any) {
-      res.status(500).json({ error: err.message });
-    }
-  });
-
-  // Pause / resume a round for a guild
-  app.post('/api/dashboard/servers/:guildId/rounds', async (req, res) => {
-    try {
-      const { guildId } = req.params;
-      const { round, action } = req.body; // round: 1-4|'all', action: 'pause'|'resume'
-      const config = await getGuildConfig(guildId) || {};
-      let pausedRounds: number[] = config.pausedRounds || [];
-      const affected = round === 'all' ? [1, 2, 3, 4] : [parseInt(round, 10)];
-      if (action === 'pause') {
-        for (const r of affected) if (!pausedRounds.includes(r)) pausedRounds.push(r);
-      } else {
-        pausedRounds = pausedRounds.filter(r => !affected.includes(r));
-      }
-      await updateGuildConfig(guildId, { ...config, pausedRounds });
-      res.json({ pausedRounds });
-    } catch (err: any) {
-      res.status(500).json({ error: err.message });
-    }
-  });
-
-  // Get guild config
-  app.get('/api/dashboard/config/:guildId', async (req, res) => {
-    try {
-      const config = await getGuildConfig(req.params.guildId) || {};
-      res.json({ config });
-    } catch (err: any) {
-      res.status(500).json({ error: err.message });
-    }
-  });
-
-  // Update guild config (price, payment methods)
-  app.post('/api/dashboard/config/:guildId', async (req, res) => {
-    try {
-      const { guildId } = req.params;
-      const existing = await getGuildConfig(guildId) || {};
-      await updateGuildConfig(guildId, { ...existing, ...req.body });
-      res.json({ ok: true });
-    } catch (err: any) {
-      res.status(500).json({ error: err.message });
-    }
-  });
-
-  // Top customers across all guilds (or per guild via ?guildId=)
-  app.get('/api/dashboard/customers', async (req, res) => {
-    try {
-      const { guildId } = req.query;
-      let query: any = db.collection('orders');
-      if (guildId) query = query.where('guildId', '==', guildId);
-      const snap = await query.get();
-
-      const map: Record<string, { userId: string; orders: number; revenue: number; name: string | null; guildName: string | null }> = {};
-      snap.docs.forEach((doc: any) => {
-        const d = doc.data();
-        const uid = d.userId;
-        if (!uid) return;
-        // Always aggregate by userId so each customer appears once
-        if (!map[uid]) {
-          const info = safeParseUserInfo(d.userInfo);
-          const gName = d.guildId ? (client.guilds.cache.get(d.guildId)?.name || null) : null;
-          map[uid] = { userId: uid, orders: 0, revenue: 0, name: info?.name || null, guildName: gName };
-        }
-        map[uid].orders++;
-        map[uid].revenue += d.totalPrice || 0;
-      });
-
-      const customers = Object.values(map)
-        .sort((a, b) => b.orders - a.orders)
-        .slice(0, 20);
-
-      res.json({ customers });
-    } catch (err: any) {
-      res.status(500).json({ error: err.message });
-    }
-  });
-
-  // Extended revenue breakdown (N days of daily data)
-  app.get('/api/dashboard/revenue', async (req, res) => {
-    try {
-      const days = Math.min(parseInt((req.query.days as string) || '30', 10), 90);
-      const result: { date: string; label: string; orders: number; revenue: number; entrees: number }[] = [];
-
-      for (let i = days - 1; i >= 0; i--) {
-        const base = new Date(new Date().toLocaleString('en-US', { timeZone: 'America/Los_Angeles' }));
-        base.setHours(0, 0, 0, 0);
-        base.setDate(base.getDate() - i);
-        const end = new Date(base); end.setHours(23, 59, 59, 999);
-        const snap = await db.collection('orders').where('createdAt', '>=', base).where('createdAt', '<=', end).get();
-        let revenue = 0, entrees = 0;
-        snap.docs.forEach((doc: any) => {
-          const d = doc.data();
-          if (d.totalPrice) revenue += d.totalPrice;
-          entrees += safeParseOrders(d.orderData).length;
-        });
-        result.push({ date: base.toISOString(), label: base.toLocaleDateString('en-US', { month: 'short', day: 'numeric' }), orders: snap.size, revenue, entrees });
-      }
-      res.json({ days: result });
-    } catch (err: any) {
-      res.status(500).json({ error: err.message });
-    }
-  });
-
-  // Get blacklist for a guild
-  app.get('/api/dashboard/blacklist/:guildId', async (req, res) => {
-    try {
-      const snap = await db.collection('guilds').doc(req.params.guildId).collection('blacklist').get();
-      const entries = snap.docs.map(doc => ({
-        userId: doc.id,
-        blockedAt: doc.data().blockedAt?.toDate?.()?.toISOString() || null,
-        reason: doc.data().reason || null,
-      }));
-      res.json({ entries });
-    } catch (err: any) {
-      res.status(500).json({ error: err.message });
-    }
-  });
-
-  // Remove from blacklist
-  app.delete('/api/dashboard/blacklist/:guildId/:userId', async (req, res) => {
-    try {
-      await db.collection('guilds').doc(req.params.guildId).collection('blacklist').doc(req.params.userId).delete();
-      res.json({ ok: true });
-    } catch (err: any) {
-      res.status(500).json({ error: err.message });
-    }
-  });
-
-  // Get credits for a guild
-  app.get('/api/dashboard/credits/:guildId', async (req, res) => {
-    try {
-      const snap = await db.collection('guilds').doc(req.params.guildId).collection('customers').where('creditBalance', '>', 0).get();
-      const credits = snap.docs.map(doc => ({
-        userId: doc.id,
-        balance: doc.data().creditBalance || 0,
-        lastReason: doc.data().lastCreditReason || null,
-        lastAdjustment: doc.data().lastCreditAdjustment?.toDate?.()?.toISOString() || null,
-      }));
-      credits.sort((a, b) => b.balance - a.balance);
-      res.json({ credits });
-    } catch (err: any) {
-      res.status(500).json({ error: err.message });
-    }
-  });
-
-  // Adjust credit for a user
-  app.post('/api/dashboard/credits/:guildId/:userId', async (req, res) => {
-    try {
-      const { guildId, userId } = req.params;
-      const { amount, reason } = req.body;
-      const ref = db.collection('guilds').doc(guildId).collection('customers').doc(userId);
-      const doc = await ref.get();
-      const current: number = doc.exists ? (doc.data()?.creditBalance || 0) : 0;
-      const newBalance = Math.max(0, current + Number(amount));
-      await ref.set({ userId, creditBalance: newBalance, lastCreditReason: reason || 'Dashboard adjustment', lastCreditAdjustment: serverTimestamp() }, { merge: true });
-      res.json({ balance: newBalance });
-    } catch (err: any) {
-      res.status(500).json({ error: err.message });
-    }
-  });
-
-  // Export all orders as CSV
-  app.get('/api/dashboard/export.csv', async (req, res) => {
-    try {
-      const { guildId, status } = req.query;
-      let query: any = db.collection('orders').orderBy('createdAt', 'desc');
-      if (guildId) query = db.collection('orders').where('guildId', '==', guildId).orderBy('createdAt', 'desc');
-      const snap = await query.get();
-
-      let csv = 'Order ID,Status,Total,Name,Phone,Email,Location,Pickup Time,Items,Server,Created At\n';
-      snap.docs.forEach((doc: any) => {
-        const d = doc.data();
-        if (status && d.status !== status) return;
-        const info = safeParseUserInfo(d.userInfo);
-        const items = safeParseOrders(d.orderData).map((i: any) => `${i.type}${i.proteins?.length ? ` (${i.proteins.join('/')})` : ''}`).join('; ');
-        const gName = d.guildId ? (client.guilds.cache.get(d.guildId)?.name || d.guildId) : '';
-        const esc = (v: any) => `"${String(v || '').replace(/"/g, '""').replace(/[\r\n]+/g, ' ')}"`;
-        csv += [doc.id, d.status, d.totalPrice || 0, info?.name, info?.phone, info?.email, info?.location, info?.time, items, gName, d.createdAt?.toDate?.()?.toISOString() || '']
-          .map(esc).join(',') + '\n';
-      });
-
-      res.setHeader('Content-Type', 'text/csv');
-      res.setHeader('Content-Disposition', `attachment; filename="orders_${Date.now()}.csv"`);
-      res.send(csv);
-    } catch (err: any) {
-      res.status(500).json({ error: err.message });
-    }
-  });
-
-  // Send DM to a user via Discord
-  app.post('/api/dashboard/dm', async (req, res) => {
-    try {
-      const { userId, message } = req.body;
-      if (!userId || !message) return res.status(400).json({ error: 'userId and message required' });
-      const user = await client.users.fetch(userId);
-      await user.send(message);
-      res.json({ ok: true });
-    } catch (err: any) {
-      res.status(500).json({ error: err.message });
-    }
-  });
-
-  // ── Settings: per-guild config (Firestore) + bot-level read-only info ────────
-
-  app.get('/api/settings', async (req, res) => {
-    try {
-      const guildId = req.query.guildId as string | undefined;
-      const cfg = guildId ? (await getGuildConfig(guildId) || {}) : {};
-      res.json({
-        guildId: guildId || null,
-        cashappCookieSet: !!(cfg as any).cashappCookie,
-        cashappCookiePreview: (cfg as any).cashappCookie
-          ? ((cfg as any).cashappCookie as string).slice(0, 24) + '…'
-          : '',
-        webhookUrl: (cfg as any).webhookUrl || '',
-        discordToken: process.env.DISCORD_TOKEN
-          ? process.env.DISCORD_TOKEN.slice(0, 20) + '…'
-          : '',
-      });
-    } catch (err: any) {
-      res.status(500).json({ error: err.message });
-    }
-  });
-
-  app.post('/api/settings', async (req, res) => {
-    try {
-      const { guildId, cashappCookie, webhookUrl } = req.body as { guildId?: string; cashappCookie?: string; webhookUrl?: string };
-      if (!guildId) return res.status(400).json({ error: 'guildId is required' });
-
-      const existing = await getGuildConfig(guildId) || {};
-      const updates: Record<string, any> = { ...existing };
-
-      if (cashappCookie !== undefined) updates.cashappCookie = cashappCookie;
-      if (webhookUrl !== undefined) updates.webhookUrl = webhookUrl;
-
-      await updateGuildConfig(guildId, updates);
-      res.json({ ok: true });
-    } catch (err: any) {
-      res.status(500).json({ error: err.message });
-    }
-  });
-
-  // ── Commands: list guilds ────────────────────────────────────────────────────
-
-  app.get('/api/dashboard/guilds', (req, res) => {
-    const guilds = client.guilds.cache.map(g => ({ id: g.id, name: g.name, memberCount: g.memberCount }));
-    res.json({ guilds });
-  });
-
-  // ── Commands: broadcast announcement to all guilds ───────────────────────────
-
-  app.post('/api/dashboard/announce', async (req, res) => {
-    try {
-      const { message, guildId } = req.body as { message: string; guildId?: string };
-      if (!message) return res.status(400).json({ error: 'message required' });
-
-      const targets = guildId
-        ? [guildId]
-        : client.guilds.cache.map(g => g.id);
-
-      let sent = 0;
-      for (const gid of targets) {
-        const cfg = await getGuildConfig(gid) || {};
-        const url = cfg.webhookUrl;
-        if (!url) continue;
-        await fetch(url, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ content: message }),
-        }).catch(() => {});
-        sent++;
-      }
-      res.json({ ok: true, sent });
-    } catch (err: any) {
-      res.status(500).json({ error: err.message });
-    }
-  });
-
-  // ── Commands: batch management ───────────────────────────────────────────────
-
-  app.get('/api/dashboard/batch/:guildId', async (req, res) => {
-    try {
-      const { guildId } = req.params;
-      const snap = await db.collection('orders')
-        .where('guildId', '==', guildId)
-        .where('batchStatus', '==', 'pending')
-        .get();
-      const orders = snap.docs.map(d => ({ id: d.id, ...d.data() }));
-      res.json({ orders });
-    } catch (err: any) {
-      res.status(500).json({ error: err.message });
-    }
-  });
-
-  app.post('/api/dashboard/batch/:guildId/clear', async (req, res) => {
-    try {
-      const { guildId } = req.params;
-      const snap = await db.collection('orders')
-        .where('guildId', '==', guildId)
-        .where('batchStatus', '==', 'pending')
-        .get();
-      const batch = db.batch();
-      snap.docs.forEach(d => batch.update(d.ref, { batchStatus: 'cleared' }));
-      await batch.commit();
-      res.json({ ok: true, cleared: snap.size });
-    } catch (err: any) {
-      res.status(500).json({ error: err.message });
-    }
-  });
-
-  // ── Commands: round summary ───────────────────────────────────────────────────
-
-  app.get('/api/dashboard/roundsummary/:guildId', async (req, res) => {
-    try {
-      const { guildId } = req.params;
-      const nowPST = new Date(new Date().toLocaleString('en-US', { timeZone: 'America/Los_Angeles' }));
-      const startOfDay = new Date(nowPST.getFullYear(), nowPST.getMonth(), nowPST.getDate(), 0, 0, 0);
-      const snap = await db.collection('orders')
-        .where('guildId', '==', guildId)
-        .where('createdAt', '>=', startOfDay)
-        .get();
-      const orders = snap.docs.map(d => d.data());
-      const summary = {
-        total: orders.length,
-        paid: orders.filter(o => o.status === 'paid' || o.status === 'paid_fulfilled').length,
-        pending: orders.filter(o => (o.status as string).startsWith('pending')).length,
-        revenue: orders
-          .filter(o => o.status === 'paid' || o.status === 'paid_fulfilled')
-          .reduce((s, o) => s + (o.total || 0), 0),
-      };
-      res.json(summary);
-    } catch (err: any) {
-      res.status(500).json({ error: err.message });
     }
   });
 
@@ -3941,39 +2610,12 @@ async function startServer() {
     });
   }
 
-  const httpServer = createHttpServer(app);
-
-  // ─── WebSocket Terminal ────────────────────────────────────────────────────
-  const wss = new WebSocketServer({ server: httpServer, path: '/terminal' });
-  wss.on('connection', (ws) => {
-    const shell = process.env.SHELL || '/bin/zsh';
-    const ptyProc = pty.spawn(shell, [], {
-      name: 'xterm-color',
-      cols: 120,
-      rows: 30,
-      cwd: process.cwd(),
-      env: process.env as Record<string, string>,
-    });
-    ptyProc.onData((data: string) => {
-      if (ws.readyState === ws.OPEN) ws.send(JSON.stringify({ type: 'output', data }));
-    });
-    ws.on('message', (raw: Buffer) => {
-      try {
-        const msg = JSON.parse(raw.toString());
-        if (msg.type === 'input') ptyProc.write(msg.data);
-        if (msg.type === 'resize') ptyProc.resize(msg.cols, msg.rows);
-      } catch { /* ignore malformed */ }
-    });
-    ws.on('close', () => ptyProc.kill());
-  });
-
-  httpServer.listen(PORT, '0.0.0.0', () => {
-    console.log(`\x1b[32m  ✅ Express ready\x1b[0m  →  http://localhost:${PORT}`);
-    console.log(`\x1b[2m  Connecting Discord bot…\x1b[0m`);
+  const server = app.listen(PORT, '0.0.0.0', () => {
+    console.log(`✅ Server running on http://localhost:${PORT}`);
     initDiscordBot();
   });
 
-  httpServer.on('error', (e: any) => {
+  server.on('error', (e: any) => {
     if (e.code === 'EADDRINUSE') {
       console.error(`❌ Port ${PORT} is already in use.`);
       process.exit(1);
@@ -4038,9 +2680,11 @@ async function handleTest(interaction: any) {
 
   try {
     // --- Step 1: Config check ---
-    const webhookOk = !!(config.webhookUrl);
+    const stripeOk = !!(config.stripeSecretKey || process.env.STRIPE_SECRET_KEY);
+    const webhookOk = !!(config.webhookUrl || process.env.DISCORD_WEBHOOK_URL);
     const paymentsConfigured = [config.cashappTag, config.venmoHandle, config.zelleEmail, config.cryptoAddress].filter(Boolean);
     results.push(`**Step 1 — Config**`);
+    results.push(`${stripeOk ? '✅' : '⚠️'} Stripe key: ${stripeOk ? 'set' : 'not set'}`);
     results.push(`${webhookOk ? '✅' : '⚠️'} Order webhook: ${webhookOk ? 'set' : 'not set'}`);
     results.push(`${paymentsConfigured.length > 0 ? '✅' : '⚠️'} Manual payments: ${paymentsConfigured.length > 0 ? paymentsConfigured.join(', ') : 'none'}`);
     results.push(`${config.basePrice ? '✅' : '⚠️'} Base price: ${config.basePrice ? `$${Number(config.basePrice).toFixed(2)}` : 'using default $5.00'}`);
@@ -4107,24 +2751,19 @@ async function handleTest(interaction: any) {
 async function handleSetup(interaction: any, notice?: string) {
   const config = await getGuildConfig(interaction.guildId) || {};
 
+  const stripeStatus = config.stripeSecretKey ? '✅ Configured' : '❌ Not set — run /admin_setup';
   const webhookStatus = config.webhookUrl ? '✅ Set' : '❌ Not set';
   const channelStatus = config.statusChannelId ? `✅ <#${config.statusChannelId}>` : '❌ Not set';
   const paymentsArr = [
     config.cashappTag && `Cash App (${config.cashappTag})`,
     config.venmoHandle && `Venmo (@${config.venmoHandle})`,
     config.zelleEmail && `Zelle (${config.zelleEmail})`,
-    config.paypalEmail && `PayPal (${config.paypalEmail})`,
     config.cryptoAddress && 'Crypto',
   ].filter(Boolean);
   const paymentsStatus = paymentsArr.length ? `✅ ${paymentsArr.join(', ')}` : '❌ None';
   const pricingStatus = config.basePrice ? `✅ $${Number(config.basePrice).toFixed(2)}/entree${config.bulkPrice ? ` · $${Number(config.bulkPrice).toFixed(2)} bulk @${config.bulkThreshold}+` : ''}` : '⚠️ Default ($5.00)';
-  const staffStatus  = config.staffRoleId ? `✅ <@&${config.staffRoleId}>` : '❌ Not set';
-  const storeStatus  = config.storeOpen !== false ? '🟢 Open' : '🔴 Closed';
-  const cashappAutoStatus = config.cashappCookie ? '✅ Auto-verify on' : '⚠️ Manual confirm';
-  const hasEmailCfgSetup = !!(config.paymentImapEmail && config.paymentImapPassword) || !!(config.zelleImapEmail && config.zelleImapPassword);
-  const emailVerifyStatus = hasEmailCfgSetup
-    ? `✅ Active (${config.paymentImapEmail || config.zelleImapEmail})`
-    : '⚠️ Not set — run `/paymentemail setup`';
+  const staffStatus = config.staffRoleId ? `✅ <@&${config.staffRoleId}>` : '❌ Not set';
+  const storeStatus = config.storeOpen !== false ? '🟢 Open' : '🔴 Closed';
 
   const description = notice
     ? `${notice}\n\nConfigure this bot for your server. Click a button below to edit that section.`
@@ -4134,17 +2773,17 @@ async function handleSetup(interaction: any, notice?: string) {
     .setTitle('⚙️ Server Setup')
     .setDescription(description)
     .addFields(
+      { name: '💳 Stripe', value: stripeStatus, inline: true },
       { name: '🔗 Order Webhook', value: webhookStatus, inline: true },
       { name: '📢 Status Channel', value: channelStatus, inline: true },
       { name: '💸 Payment Methods', value: paymentsStatus, inline: true },
       { name: '💰 Pricing', value: pricingStatus, inline: true },
       { name: '👥 Staff Role', value: staffStatus, inline: true },
       { name: '🏪 Store Status', value: storeStatus, inline: true },
-      { name: '💸 Cash App Auto-Verify', value: cashappAutoStatus, inline: true },
-      { name: '📧 Email Payment Verify', value: emailVerifyStatus, inline: true },
     );
 
   const row1 = new ActionRowBuilder<ButtonBuilder>().addComponents(
+    new ButtonBuilder().setCustomId('setup_stripe').setLabel('💳 Stripe Keys').setStyle(ButtonStyle.Primary),
     new ButtonBuilder().setCustomId('setup_webhook').setLabel('🔗 Webhook & Channel').setStyle(ButtonStyle.Primary),
     new ButtonBuilder().setCustomId('setup_payments').setLabel('💸 Payments').setStyle(ButtonStyle.Primary),
     new ButtonBuilder().setCustomId('setup_pricing').setLabel('💰 Pricing').setStyle(ButtonStyle.Secondary),
@@ -4212,7 +2851,7 @@ async function handleRevenue(interaction: any) {
       { name: 'Total Orders', value: `${totalOrders}`, inline: true },
       { name: 'Total Revenue', value: `$${totalRevenue.toFixed(2)}`, inline: true }
     )
-    .setFooter({ text: 'Use /stats for today\'s breakdown. Use /export for full CSV history.' });
+    .setFooter({ text: 'Detailed daily/weekly/monthly breakdown coming soon.' });
 
   await interaction.editReply({ embeds: [embed] });
 }
@@ -4356,7 +2995,7 @@ async function handleSetPrice(interaction: any) {
   }
 
   // Recalculate totalPrice on all unpaid pending orders
-  const pendingStatuses = ['pending', 'pending_cashapp', 'pending_venmo', 'pending_zelle', 'pending_crypto', 'pending_paypal'];
+  const pendingStatuses = ['pending', 'pending_cashapp', 'pending_venmo', 'pending_zelle', 'pending_crypto'];
   let updatedCount = 0;
 
   for (const status of pendingStatuses) {
@@ -4507,7 +3146,7 @@ async function handleBranding(interaction: any) {
 
 async function announceStoreOpen(guildId: string) {
   const guildConfig = await getGuildConfig(guildId) || {};
-  const webhookUrl = guildConfig.webhookUrl;
+  const webhookUrl = guildConfig.webhookUrl || process.env.DISCORD_WEBHOOK_URL;
   if (!webhookUrl) return;
   try {
     await fetch(webhookUrl, {
@@ -4544,7 +3183,7 @@ async function handleRenameChannel(interaction: any) {
   const statusChannelId = config.statusChannelId;
 
   if (!statusChannelId) {
-    return await interaction.editReply({ content: '❌ No status channel configured. Set one in `/setup main` → Webhook & Channel.' });
+    return await interaction.editReply({ content: '❌ No status channel configured. Set one in `/admin_setup` → Webhook & Channel.' });
   }
 
   try {
@@ -4662,7 +3301,7 @@ async function handleToggle(interaction: any) {
 async function handlePending(interaction: any) {
   await interaction.deferReply({ flags: MessageFlags.Ephemeral });
 
-  const pendingStatuses = ['pending', 'pending_cashapp', 'pending_venmo', 'pending_zelle', 'pending_crypto', 'pending_paypal'];
+  const pendingStatuses = ['pending', 'pending_cashapp', 'pending_venmo', 'pending_zelle', 'pending_crypto'];
   const allOrders: any[] = [];
 
   for (const status of pendingStatuses) {
@@ -4685,7 +3324,7 @@ async function handlePending(interaction: any) {
       const parsedOrders = safeParseOrders(order.orderData);
       const parsedInfo = safeParseUserInfo(order.userInfo);
       const orderDetails = formatOrderItems(parsedOrders);
-      const paymentLabel = order.status === 'pending' ? 'Unconfirmed'
+      const paymentLabel = order.status === 'pending' ? 'Stripe (unconfirmed)'
         : order.status.replace('pending_', '').replace(/^\w/, (c: string) => c.toUpperCase());
       let fieldValue = `**Customer:** ${parsedInfo?.name || `<@${order.userId}>`}\n${orderDetails}\n**Total:** $${order.totalPrice?.toFixed(2) ?? '—'}`;
       if (fieldValue.length > 1024) fieldValue = fieldValue.slice(0, 1020) + '...';
@@ -4715,7 +3354,7 @@ async function handleSettings(interaction: any) {
   const config = await getGuildConfig(interaction.guildId) || {};
   const embed = createEmbed(config)
     .setTitle('⚙️ Bot Settings')
-    .setDescription('Use **`/setup main`** for a full guided configuration dashboard.\n\nIndividual commands:\n\n⚙️ `/setup main` — Full setup (webhook, payments, pricing, staff, branding)\n🔁 `/toggle` — Enable or disable ordering\n📢 `/storestatus` — Open/close the store\n📋 `/format` — Customize order detail format\n🗓️ `/schedule` — View queue schedule');
+    .setDescription('Use **`/admin_setup`** for a full guided configuration dashboard.\n\nIndividual commands:\n\n💳 `/admin_setup` — Full setup (Stripe, webhook, payments, pricing, staff, branding)\n🔁 `/toggle` — Enable or disable ordering\n📢 `/storestatus` — Open/close the store\n📋 `/format` — Customize order detail format\n🗓️ `/schedule` — View queue schedule');
   
   await interaction.reply({ embeds: [embed], flags: MessageFlags.Ephemeral });
 }
@@ -4754,7 +3393,20 @@ async function showAdminOrders(interaction: any, status: string) {
     .setTitle(`📋 Orders — ${status.replace('_', ' ').replace(/\b\w/g, c => c.toUpperCase())}`)
     .setDescription(orders.length > 0 ? `📦 Found **${orders.length}** order(s).` : '✅ No orders found.');
 
-  const row1 = makeSelect('admin_filter_status', 'Filter by status', ORDER_STATUS_OPTIONS);
+  const filterSelect = new StringSelectMenuBuilder()
+    .setCustomId('admin_filter_status')
+    .setPlaceholder('Filter by status')
+    .addOptions([
+      { label: '🕐 Pending', value: 'pending' },
+      { label: '💸 Pending Cash App', value: 'pending_cashapp' },
+      { label: '🔵 Pending Venmo', value: 'pending_venmo' },
+      { label: '🟣 Pending Zelle', value: 'pending_zelle' },
+      { label: '🪙 Pending Crypto', value: 'pending_crypto' },
+      { label: '✅ Paid', value: 'paid' },
+      { label: '🎉 Fulfilled', value: 'paid_fulfilled' }
+    ]);
+
+  const row1 = new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(filterSelect);
   const components: any[] = [row1];
 
   if (orders.length > 0) {
@@ -4785,9 +3437,6 @@ async function showAdminOrders(interaction: any, status: string) {
     } else if (status === 'pending_zelle') {
       btnId = 'admin_confirm_all_zelle';
       btnLabel = 'Confirm All Zelle Orders';
-    } else if (status === 'pending_paypal') {
-      btnId = 'admin_confirm_all_paypal';
-      btnLabel = 'Confirm All PayPal Orders';
     } else if (status === 'pending_crypto') {
       btnId = 'admin_confirm_all_crypto';
       btnLabel = 'Confirm All Crypto Orders';
@@ -4849,7 +3498,7 @@ async function fulfillOrder(orderId: string, notifyUser: boolean = true) {
     const parsedUserInfo = safeParseUserInfo(orderData?.userInfo);
 
     const fmtConfig = guildId ? (await getGuildConfig(guildId) || {}) : {};
-    const discordWebhookUrl = fmtConfig.webhookUrl;
+    const discordWebhookUrl = fmtConfig.webhookUrl || process.env.DISCORD_WEBHOOK_URL;
     const payloadText = formatConfirmedOrderPayload(userId, parsedUserInfo, parsedOrders, fmtConfig);
 
     // Send to kitchen webhook (non-blocking — failure does not prevent DM or screen update)
@@ -4935,19 +3584,26 @@ function createPortionRow(prefix: string) {
 async function showEntreeSelect(interaction: any, state: any) {
   const config = await getGuildConfig(interaction.guildId || state.guildId) || {};
   const entreePrompt = config.entreePrompt || 'Choose your entree:';
-  const row = makeSelect('entree_select', 'Choose your entree', [
-    { label: '🥗 Burrito Bowl', value: 'Burrito Bowl' },
-    { label: '🌯 Burrito', value: 'Burrito' },
-    { label: '🧀 Quesadilla', value: 'Quesadilla' },
-    { label: '🥙 Salad Bowl', value: 'Salad Bowl' },
-    { label: '🌮 Tacos', value: 'Tacos' },
-  ]);
+
+  const select = new StringSelectMenuBuilder()
+    .setCustomId('entree_select')
+    .setPlaceholder('Choose your entree')
+    .addOptions(
+      { label: '🥗 Burrito Bowl', value: 'Burrito Bowl' },
+      { label: '🌯 Burrito', value: 'Burrito' },
+      { label: '🧀 Quesadilla', value: 'Quesadilla' },
+      { label: '🥙 Salad Bowl', value: 'Salad Bowl' },
+      { label: '🌮 Tacos', value: 'Tacos' },
+    );
+  const row = new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(select);
+  
   const components: any[] = [row];
   if (state.orders && state.orders.length > 0) {
-    components.push(new ActionRowBuilder<ButtonBuilder>().addComponents(
-      new ButtonBuilder().setCustomId('back_to_review').setLabel('Back to Review').setStyle(ButtonStyle.Danger)
-    ));
+    const backBtn = new ButtonBuilder().setCustomId('back_to_review').setLabel('Back to Review').setStyle(ButtonStyle.Danger);
+    const backRow = new ActionRowBuilder<ButtonBuilder>().addComponents(backBtn);
+    components.push(backRow);
   }
+
   const method = interaction.replied || interaction.deferred ? 'editReply' : (interaction.isButton() || interaction.isStringSelectMenu() ? 'update' : 'reply');
   await interaction[method]({ content: entreePrompt, components, embeds: [], flags: MessageFlags.Ephemeral });
 }
@@ -4955,18 +3611,24 @@ async function showEntreeSelect(interaction: any, state: any) {
 async function showProteinSelect(interaction: any, state: any) {
   const config = await getGuildConfig(interaction.guildId || state.guildId) || {};
   const proteinPrompt = config.proteinPrompt || 'Now choose your protein:';
-  const row = makeSelect('protein_select', 'Choose Protein or Veggie', [
-    { label: '🍗 Chicken', value: 'Chicken' },
-    { label: '🌶️ Chicken Al Pastor', value: 'Chicken Al Pastor' },
-    { label: '🥩 Steak', value: 'Steak' },
-    { label: '🐄 Beef Barbacoa', value: 'Beef Barbacoa' },
-    { label: '🐷 Carnitas', value: 'Carnitas' },
-    { label: '🌱 Sofritas', value: 'Sofritas' },
-    { label: '🥦 Veggie', value: 'Veggie' },
-  ], { min: 1, max: 1 });
-  const backRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
-    new ButtonBuilder().setCustomId('back_to_entree').setLabel('Back').setStyle(ButtonStyle.Danger)
-  );
+
+  const select = new StringSelectMenuBuilder()
+    .setCustomId('protein_select')
+    .setPlaceholder('Choose Protein or Veggie')
+    .setMinValues(1)
+    .setMaxValues(1)
+    .addOptions(
+      { label: '🍗 Chicken', value: 'Chicken' },
+      { label: '🌶️ Chicken Al Pastor', value: 'Chicken Al Pastor' },
+      { label: '🥩 Steak', value: 'Steak' },
+      { label: '🐄 Beef Barbacoa', value: 'Beef Barbacoa' },
+      { label: '🐷 Carnitas', value: 'Carnitas' },
+      { label: '🌱 Sofritas', value: 'Sofritas' },
+      { label: '🥦 Veggie', value: 'Veggie' },
+    );
+  const row = new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(select);
+  const backBtn = new ButtonBuilder().setCustomId('back_to_entree').setLabel('Back').setStyle(ButtonStyle.Danger);
+  const backRow = new ActionRowBuilder<ButtonBuilder>().addComponents(backBtn);
   await interaction.update({ content: `Selected: **${state.currentOrder.type}**. ${proteinPrompt}`, components: [row, backRow] });
 }
 
@@ -4979,14 +3641,17 @@ async function showProteinPortion(interaction: any, state: any) {
 }
 
 async function showRiceSelect(interaction: any, state: any) {
-  const row = makeSelect('rice_select', 'Choose Rice', [
-    { label: '🍚 White Rice', value: 'White Rice' },
-    { label: '🌾 Brown Rice', value: 'Brown Rice' },
-    { label: '❌ None', value: 'None' },
-  ]);
-  const backRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
-    new ButtonBuilder().setCustomId('back_to_protein_portion').setLabel('◀️ Back').setStyle(ButtonStyle.Danger)
-  );
+  const select = new StringSelectMenuBuilder()
+    .setCustomId('rice_select')
+    .setPlaceholder('Choose Rice')
+    .addOptions(
+      { label: '🍚 White Rice', value: 'White Rice' },
+      { label: '🌾 Brown Rice', value: 'Brown Rice' },
+      { label: '❌ None', value: 'None' },
+    );
+  const row = new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(select);
+  const backBtn = new ButtonBuilder().setCustomId('back_to_protein_portion').setLabel('◀️ Back').setStyle(ButtonStyle.Danger);
+  const backRow = new ActionRowBuilder<ButtonBuilder>().addComponents(backBtn);
   await interaction.update({ content: '🍚 Choose your rice:', components: [row, backRow] });
 }
 
@@ -4998,15 +3663,18 @@ async function showRicePortion(interaction: any, state: any) {
 }
 
 async function showBeansSelect(interaction: any, state: any) {
-  const row = makeSelect('beans_select', 'Choose Beans', [
-    { label: '⚫ Black Beans', value: 'Black Beans' },
-    { label: '🟤 Pinto Beans', value: 'Pinto Beans' },
-    { label: '❌ None', value: 'None' },
-  ]);
+  const select = new StringSelectMenuBuilder()
+    .setCustomId('beans_select')
+    .setPlaceholder('Choose Beans')
+    .addOptions(
+      { label: '⚫ Black Beans', value: 'Black Beans' },
+      { label: '🟤 Pinto Beans', value: 'Pinto Beans' },
+      { label: '❌ None', value: 'None' },
+    );
+  const row = new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(select);
   const backId = state.currentOrder.rice.type === 'None' ? 'back_to_rice_select' : 'back_to_rice_portion';
-  const backRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
-    new ButtonBuilder().setCustomId(backId).setLabel('Back').setStyle(ButtonStyle.Danger)
-  );
+  const backBtn = new ButtonBuilder().setCustomId(backId).setLabel('Back').setStyle(ButtonStyle.Danger);
+  const backRow = new ActionRowBuilder<ButtonBuilder>().addComponents(backBtn);
   await interaction.update({ content: '🫘 Choose your beans:', components: [row, backRow] });
 }
 
@@ -5019,21 +3687,29 @@ async function showBeansPortion(interaction: any, state: any) {
 
 async function showToppingsSelect(interaction: any, state: any) {
   const entreeType = state.currentOrder.type;
-  const maxToppings = entreeType === 'Quesadilla' ? 2 : entreeType === 'Tacos' ? 4 : 8;
-  const row = makeSelect('toppings_select', 'Choose Toppings', [
-    { label: '🍅 Fresh Tomato Salsa', value: 'Fresh Tomato Salsa' },
-    { label: '🌽 Roasted Chili-Corn Salsa', value: 'Roasted Chili-Corn Salsa' },
-    { label: '🟢 Tomatillo-Green Chili Salsa', value: 'Tomatillo-Green Chili Salsa' },
-    { label: '🔴 Tomatillo-Red Chili Salsa', value: 'Tomatillo-Red Chili Salsa' },
-    { label: '🥛 Sour Cream', value: 'Sour Cream' },
-    { label: '🫑 Fajita Veggies', value: 'Fajita Veggies' },
-    { label: '🧀 Cheese', value: 'Cheese' },
-    { label: '🥬 Romaine Lettuce', value: 'Romaine Lettuce' },
-  ], { min: 0, max: maxToppings });
+  let maxToppings = 8;
+  if (entreeType === 'Quesadilla') maxToppings = 2;
+  if (entreeType === 'Tacos') maxToppings = 4;
+
+  const select = new StringSelectMenuBuilder()
+    .setCustomId('toppings_select')
+    .setPlaceholder('Choose Toppings')
+    .setMinValues(0)
+    .setMaxValues(maxToppings)
+    .addOptions(
+      { label: '🍅 Fresh Tomato Salsa', value: 'Fresh Tomato Salsa' },
+      { label: '🌽 Roasted Chili-Corn Salsa', value: 'Roasted Chili-Corn Salsa' },
+      { label: '🟢 Tomatillo-Green Chili Salsa', value: 'Tomatillo-Green Chili Salsa' },
+      { label: '🔴 Tomatillo-Red Chili Salsa', value: 'Tomatillo-Red Chili Salsa' },
+      { label: '🥛 Sour Cream', value: 'Sour Cream' },
+      { label: '🫑 Fajita Veggies', value: 'Fajita Veggies' },
+      { label: '🧀 Cheese', value: 'Cheese' },
+      { label: '🥬 Romaine Lettuce', value: 'Romaine Lettuce' },
+    );
+  const row = new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(select);
   const backId = state.currentOrder.beans.type === 'None' ? 'back_to_beans_select' : 'back_to_beans_portion';
-  const backRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
-    new ButtonBuilder().setCustomId(backId).setLabel('Back').setStyle(ButtonStyle.Danger)
-  );
+  const backBtn = new ButtonBuilder().setCustomId(backId).setLabel('Back').setStyle(ButtonStyle.Danger);
+  const backRow = new ActionRowBuilder<ButtonBuilder>().addComponents(backBtn);
   await interaction.update({ content: '🥗 Choose your toppings (select all that apply):', components: [row, backRow] });
 }
 
@@ -5047,15 +3723,20 @@ async function showToppingPortion(interaction: any, state: any, index: number) {
 }
 
 async function showPremiumSelect(interaction: any, state: any) {
-  const row = makeSelect('premium_select', 'Choose Premium Topping(s)', [
-    { label: '🥑 Guacamole', value: 'Guacamole' },
-    { label: '🫕 Queso', value: 'Queso' },
-    { label: '❌ None', value: 'None' },
-  ], { min: 1, max: 3 });
+  const select = new StringSelectMenuBuilder()
+    .setCustomId('premium_select')
+    .setPlaceholder('Choose Premium Topping(s)')
+    .setMinValues(1)
+    .setMaxValues(3)
+    .addOptions(
+      { label: '🥑 Guacamole', value: 'Guacamole' },
+      { label: '🫕 Queso', value: 'Queso' },
+      { label: '❌ None', value: 'None' },
+    );
+  const row = new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(select);
   const backId = state.currentOrder.selectedToppings.length === 0 ? 'back_to_toppings_select' : `back_to_topping_${state.currentOrder.selectedToppings.length - 1}`;
-  const backRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
-    new ButtonBuilder().setCustomId(backId).setLabel('Back').setStyle(ButtonStyle.Danger)
-  );
+  const backBtn = new ButtonBuilder().setCustomId(backId).setLabel('Back').setStyle(ButtonStyle.Danger);
+  const backRow = new ActionRowBuilder<ButtonBuilder>().addComponents(backBtn);
   await interaction.update({ content: '⭐ Add a premium topping (optional):', components: [row, backRow] });
 }
 
@@ -5099,11 +3780,8 @@ async function showReview(interaction: any, state: any) {
     optionsStr += `**Item Total: $${itemPrice.toFixed(2)}**`;
     grandTotal += itemPrice;
 
-    const fieldTitle = order.entreeName
-      ? `${i + 1}. ${order.type} — ${order.entreeName}`
-      : `${i + 1}. ${order.type}`;
-    embed.addFields({
-      name: fieldTitle,
+    embed.addFields({ 
+      name: `${i + 1}. ${order.type}`, 
       value: optionsStr
     });
   });
@@ -5113,7 +3791,7 @@ async function showReview(interaction: any, state: any) {
     value: `### **Total Amount: $${grandTotal.toFixed(2)}**`
   });
 
-  const maxEntrees: number = Math.min(state.maxEntrees || 8, 8);
+  const maxEntrees: number = state.maxEntrees || 9;
   const atMax = state.orders.length >= maxEntrees;
   const remaining = maxEntrees - state.orders.length;
   const addLabel = atMax ? null : (remaining === 1 ? '➕ Add Last Item' : `➕ Add Item (${state.orders.length}/${maxEntrees})`);
@@ -5130,19 +3808,9 @@ async function showReview(interaction: any, state: any) {
   const rowBtns = [editBtn, removeBtn, checkoutBtn, backBtn];
   if (addBtn) rowBtns.unshift(addBtn);
   const row = new ActionRowBuilder<ButtonBuilder>().addComponents(rowBtns);
-
-  const components: any[] = [row];
-  // Show "Repeat Order" button when there are items and repeating won't exceed 9
-  if (state.orders.length > 0 && state.orders.length * 2 <= 9) {
-    const repeatBtn = new ButtonBuilder()
-      .setCustomId('repeat_order_start')
-      .setLabel('🔄 Repeat Order')
-      .setStyle(ButtonStyle.Secondary);
-    components.push(new ActionRowBuilder<ButtonBuilder>().addComponents(repeatBtn));
-  }
-
+  
   const method = interaction.replied || interaction.deferred ? 'editReply' : 'update';
-  await interaction[method]({ content: '', embeds: [embed], components });
+  await interaction[method]({ content: '', embeds: [embed], components: [row] });
 }
 
 async function showEditSelect(interaction: any, state: any) {
@@ -5280,7 +3948,6 @@ async function handleMyOrders(interaction: any) {
     if (order.status === 'paid_fulfilled') status = '🎉 Fulfilled';
     else if (order.status === 'paid') status = '🍳 Paid (Preparing)';
     else if (order.status === 'pending_cashapp') status = '💸 Pending Cash App';
-    else if (order.status === 'pending_paypal') status = '🅿️ Pending PayPal';
     else if (order.status === 'pending_venmo') status = '🔵 Pending Venmo';
     else if (order.status === 'pending_zelle') status = '🟣 Pending Zelle';
     else if (order.status === 'pending_crypto') status = '🪙 Pending Crypto';
@@ -5296,49 +3963,6 @@ async function handleMyOrders(interaction: any) {
   });
   
   await interaction.reply({ embeds: [embed], flags: MessageFlags.Ephemeral });
-}
-
-async function handleDeposit(interaction: any) {
-  const amount: number = interaction.options.getNumber('amount');
-  if (!amount || amount <= 0) {
-    return await interaction.reply({ content: '❌ Please provide a valid deposit amount.', flags: MessageFlags.Ephemeral });
-  }
-
-  const config = await getGuildConfig(interaction.guildId!) || {};
-  const methods: { id: string; label: string; configured: boolean }[] = [
-    { id: 'deposit_pay_cashapp', label: '💸 Cash App',  configured: !!config.cashappTag },
-    { id: 'deposit_pay_venmo',   label: '💸 Venmo',     configured: !!config.venmoHandle },
-    { id: 'deposit_pay_zelle',   label: '💸 Zelle',     configured: !!config.zelleEmail },
-    { id: 'deposit_pay_paypal',  label: '🅿️ PayPal',    configured: !!config.paypalEmail },
-  ];
-
-  const available = methods.filter(m => m.configured);
-  if (!available.length) {
-    return await interaction.reply({ content: '❌ No payment methods are configured on this server yet. Ask an admin to run `/setup main`.', flags: MessageFlags.Ephemeral });
-  }
-
-  // Generate deposit ID and store in user session state
-  const depositId = generateShortOrderId().slice(0, 6); // 3 letters + 3 numbers
-  const stateKey = `${interaction.user.id}:${interaction.guildId}`;
-  const state = orderState.get(stateKey) || {};
-  state.pendingDepositId = depositId;
-  state.pendingDepositAmount = amount;
-  state.pendingDepositMethod = null;
-  orderState.set(stateKey, state);
-
-  const buttons = available.map(m =>
-    new ButtonBuilder().setCustomId(m.id).setLabel(m.label).setStyle(ButtonStyle.Primary)
-  );
-
-  const embed = createEmbed(config)
-    .setTitle('💳 Deposit Funds to Wallet')
-    .setDescription(`You are depositing **$${amount.toFixed(2)}** to your wallet.\n\nSelect your preferred payment method below.\nYour wallet will be credited automatically once payment is verified.`);
-
-  await interaction.reply({
-    embeds: [embed],
-    components: [new ActionRowBuilder<ButtonBuilder>().addComponents(...buttons.slice(0, 5))],
-    flags: MessageFlags.Ephemeral,
-  });
 }
 
 async function handleWallet(interaction: any) {
@@ -5743,7 +4367,7 @@ function buildFoodieForm(customers: any[]): string {
     for (const t of o.toppings) {
       form += `${t.portion !== 'Regular' ? t.portion + ' ' : ''}${t.type}\n`;
     }
-    if (o.premiums && o.premiums.length > 0) for (const p of o.premiums) form += `${p}\n`;
+    if (o.premium && o.premium !== 'None') form += `${o.premium}\n`;
   });
 
   return form.trim();
@@ -5876,8 +4500,8 @@ function formatFoodieCustomers(customers: any[], _config: any): string {
       block += `${t.portion !== 'Regular' ? t.portion + ' ' : ''}${t.type}\n`;
     }
     // Premium
-    if (o.premiums && o.premiums.length > 0) {
-      for (const p of o.premiums) block += `${p}\n`;
+    if (o.premium && o.premium !== 'None') {
+      block += `${o.premium}\n`;
     }
 
     blocks.push(block.trim());
@@ -5950,7 +4574,7 @@ async function handleRoundSummary(interaction: any) {
 
   const statusIcon: Record<string, string> = {
     paid_fulfilled: '✅', paid: '💳', pending: '⏳',
-    pending_venmo: '💸', pending_cashapp: '💸', pending_zelle: '💸', pending_paypal: '🅿️',
+    pending_venmo: '💸', pending_cashapp: '💸', pending_zelle: '💸',
     pending_crypto: '🔑', cancelled: '❌',
   };
 
@@ -6092,7 +4716,7 @@ async function handleFormatOrderFoodie(interaction: any) {
 
   // Missing fields — build the form and ask the user to fill it in
   const stateKey = `${interaction.user.id}:${interaction.guildId}`;
-  pendingFoodieOrders.set(stateKey, { customers, config, createdAt: Date.now() });
+  pendingFoodieOrders.set(stateKey, { customers, config });
 
   const formText = buildFoodieForm(customers);
   console.log(`[foodie] form text (${formText.length} chars):\n${formText}`);

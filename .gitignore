@@ -7,3 +7,6 @@ coverage/
 .env*
 !.env.example
 service-account.json
+
+electron-app/
+electron-dist/
