@@ -180,7 +180,7 @@ function formatConfirmedOrderPayload(userId: string, userInfo: any, parsedOrders
 
     return itemFmt
       .replace(/{#}/g, String(index + 1))
-      .replace(/{name}/g, userInfo.name || 'N/A')
+      .replace(/{name}/g, order.name || userInfo.name || 'N/A')
       .replace(/{entree}/g, order.type)
       .replace(/{protein}/g, proteinStr)
       .replace(/{rice}/g, riceStr)
@@ -666,12 +666,6 @@ async function showOrderModal(interaction: any) {
     .setCustomId('order_info_modal')
     .setTitle('Chipotle Order — Contact Info');
 
-  const nameInput = new TextInputBuilder()
-    .setCustomId('name')
-    .setLabel('Name on Order')
-    .setStyle(TextInputStyle.Short)
-    .setRequired(true);
-
   const locationInput = new TextInputBuilder()
     .setCustomId('zipcode')
     .setLabel('Zip Code (to find nearby Chipotle)')
@@ -694,13 +688,12 @@ async function showOrderModal(interaction: any) {
 
   const entreesInput = new TextInputBuilder()
     .setCustomId('entrees')
-    .setLabel('Number of Entrees (1–9)')
+    .setLabel('Number of Entrees (1–8)')
     .setStyle(TextInputStyle.Short)
     .setPlaceholder('e.g. 2')
     .setRequired(true);
 
   modal.addComponents(
-    new ActionRowBuilder<ModalActionRowComponentBuilder>().addComponents(nameInput),
     new ActionRowBuilder<ModalActionRowComponentBuilder>().addComponents(locationInput),
     new ActionRowBuilder<ModalActionRowComponentBuilder>().addComponents(phoneInput),
     new ActionRowBuilder<ModalActionRowComponentBuilder>().addComponents(emailInput),
@@ -1316,6 +1309,26 @@ async function initDiscordBot() {
             }
           }
 
+          if (interaction.customId === 'order_name_modal') {
+            const state = orderState.get(`${interaction.user.id}:${interaction.guildId}`);
+            if (!state) return await interaction.reply({ content: '❌ Session expired. Please run /order again.', flags: MessageFlags.Ephemeral });
+            const name = sanitizeInput(interaction.fields.getTextInputValue('order_name'), 100);
+            state.info.name = name;
+            state.lastUpdated = Date.now();
+            await interaction.deferUpdate();
+            await showPickupTimeSelect(interaction, state);
+          }
+
+          if (interaction.customId === 'per_order_name_modal') {
+            const state = orderState.get(`${interaction.user.id}:${interaction.guildId}`);
+            if (!state) return await interaction.reply({ content: '❌ Session expired. Please run /order again.', flags: MessageFlags.Ephemeral });
+            const name = sanitizeInput(interaction.fields.getTextInputValue('per_order_name'), 100);
+            state.pendingOrderName = name;
+            state.lastUpdated = Date.now();
+            await interaction.deferUpdate();
+            await showEntreeSelect(interaction, state);
+          }
+
           if (interaction.customId === 'order_info_modal') {
             const email = interaction.fields.getTextInputValue('email');
             if (!email.toLowerCase().endsWith('@gmail.com')) {
@@ -1334,8 +1347,8 @@ async function initDiscordBot() {
 
             const rawEntrees = interaction.fields.getTextInputValue('entrees').trim();
             const parsedEntrees = parseInt(rawEntrees, 10);
-            if (isNaN(parsedEntrees) || parsedEntrees < 1 || parsedEntrees > 9) {
-              return await interaction.reply({ content: '❌ Please enter a number of entrees between 1 and 9.', flags: MessageFlags.Ephemeral });
+            if (isNaN(parsedEntrees) || parsedEntrees < 1 || parsedEntrees > 8) {
+              return await interaction.reply({ content: '❌ Please enter a number of entrees between 1 and 8.', flags: MessageFlags.Ephemeral });
             }
 
             await interaction.deferUpdate();
@@ -1438,7 +1451,7 @@ async function initDiscordBot() {
               guildId: interaction.guildId,
               maxEntrees,
               info: {
-                name: sanitizeInput(interaction.fields.getTextInputValue('name'), 100),
+                name: '',
                 location: '',
                 time: '',
                 phone: sanitizeInput(rawPhone, 20),
@@ -1816,7 +1829,7 @@ async function initDiscordBot() {
               // Strip the index prefix (e.g. "0:1260 North Fry Road..." → "1260 North Fry Road...")
               state.info.location = interaction.values[0].replace(/^\d+:/, '');
               state.lastUpdated = Date.now();
-              await showPickupTimeSelect(interaction, state);
+              await showNamePrompt(interaction, state);
             } else if (['pickup_time_select', 'pickup_time_select_1', 'pickup_time_select_2'].includes(interaction.customId)) {
               await interaction.deferUpdate();
               state.info.time = interaction.values[0];
@@ -1863,6 +1876,10 @@ async function initDiscordBot() {
                 state.orders.splice(state.editingIndex, 0, state.currentOrder);
                 state.editingIndex = null;
               } else {
+                if (state.askNamePerOrder && state.pendingOrderName !== undefined) {
+                  state.currentOrder.name = state.pendingOrderName;
+                  state.pendingOrderName = undefined;
+                }
                 state.orders.push(state.currentOrder);
               }
               
@@ -1918,6 +1935,29 @@ async function initDiscordBot() {
               } else {
                 await showPremiumSelect(interaction, state);
               }
+            } else if (interaction.customId === 'same_name_yes') {
+              // Show modal to collect one shared name for all entrees
+              const modal = new ModalBuilder().setCustomId('order_name_modal').setTitle('Name on Order');
+              const nameField = new TextInputBuilder().setCustomId('order_name').setLabel('Name for all entrees').setStyle(TextInputStyle.Short).setRequired(true);
+              modal.addComponents(new ActionRowBuilder<ModalActionRowComponentBuilder>().addComponents(nameField));
+              await interaction.showModal(modal);
+            } else if (interaction.customId === 'same_name_no') {
+              state.askNamePerOrder = true;
+              state.pendingOrderName = undefined;
+              await showPickupTimeSelect(interaction, state);
+            } else if (interaction.customId === 'enter_order_name') {
+              // Single-entree: collect name then go to pickup time
+              const modal = new ModalBuilder().setCustomId('order_name_modal').setTitle('Name on Order');
+              const nameField = new TextInputBuilder().setCustomId('order_name').setLabel('Name for this order').setStyle(TextInputStyle.Short).setRequired(true);
+              modal.addComponents(new ActionRowBuilder<ModalActionRowComponentBuilder>().addComponents(nameField));
+              await interaction.showModal(modal);
+            } else if (interaction.customId === 'enter_per_order_name') {
+              // Per-order name before each entree
+              const orderNum = state.orders.length + 1;
+              const modal = new ModalBuilder().setCustomId('per_order_name_modal').setTitle(`Name for Order ${orderNum}`);
+              const nameField = new TextInputBuilder().setCustomId('per_order_name').setLabel(`Name for entree #${orderNum}`).setStyle(TextInputStyle.Short).setRequired(true);
+              modal.addComponents(new ActionRowBuilder<ModalActionRowComponentBuilder>().addComponents(nameField));
+              await interaction.showModal(modal);
             } else if (interaction.customId === 'add_more') {
               state.currentOrder = { type: '', proteins: [], rice: { type: 'None' }, beans: { type: 'None' }, toppings: [], selectedToppings: [], premiums: [] };
               await showEntreeSelect(interaction, state);
@@ -3581,7 +3621,35 @@ function createPortionRow(prefix: string) {
   );
 }
 
+async function showNamePrompt(interaction: any, state: any) {
+  const method = interaction.replied || interaction.deferred ? 'editReply' : 'update';
+  if (state.maxEntrees === 1) {
+    const btn = new ButtonBuilder().setCustomId('enter_order_name').setLabel('📝 Enter Name for Order').setStyle(ButtonStyle.Primary);
+    const row = new ActionRowBuilder<ButtonBuilder>().addComponents(btn);
+    await interaction[method]({ content: '📍 Location saved! What name should we put on your order?', components: [row], embeds: [] });
+  } else {
+    const yesBtn = new ButtonBuilder().setCustomId('same_name_yes').setLabel('✅ Yes, same name for all').setStyle(ButtonStyle.Success);
+    const noBtn = new ButtonBuilder().setCustomId('same_name_no').setLabel('❌ No, different names').setStyle(ButtonStyle.Secondary);
+    const row = new ActionRowBuilder<ButtonBuilder>().addComponents(yesBtn, noBtn);
+    await interaction[method]({ content: `📍 Location saved! You have **${state.maxEntrees}** entrees — should all use the same name?`, components: [row], embeds: [] });
+  }
+}
+
+async function showPerOrderNamePrompt(interaction: any, state: any) {
+  const orderNum = state.orders.length + 1;
+  const btn = new ButtonBuilder().setCustomId('enter_per_order_name').setLabel(`📝 Enter Name for Entree #${orderNum}`).setStyle(ButtonStyle.Primary);
+  const row = new ActionRowBuilder<ButtonBuilder>().addComponents(btn);
+  const method = interaction.replied || interaction.deferred ? 'editReply' : (interaction.isButton() || interaction.isStringSelectMenu() ? 'update' : 'reply');
+  await interaction[method]({ content: `What name should go on **Entree #${orderNum}**?`, components: [row], embeds: [], flags: MessageFlags.Ephemeral });
+}
+
 async function showEntreeSelect(interaction: any, state: any) {
+  // If per-order naming is enabled and we don't yet have a name for this entree (not editing)
+  const isEditing = state.editingIndex !== null && state.editingIndex !== undefined;
+  if (state.askNamePerOrder && state.pendingOrderName === undefined && !isEditing) {
+    return await showPerOrderNamePrompt(interaction, state);
+  }
+
   const config = await getGuildConfig(interaction.guildId || state.guildId) || {};
   const entreePrompt = config.entreePrompt || 'Choose your entree:';
 
@@ -3780,8 +3848,11 @@ async function showReview(interaction: any, state: any) {
     optionsStr += `**Item Total: $${itemPrice.toFixed(2)}**`;
     grandTotal += itemPrice;
 
-    embed.addFields({ 
-      name: `${i + 1}. ${order.type}`, 
+    const orderTitle = state.askNamePerOrder && order.name
+      ? `${i + 1}. ${order.type} — ${order.name}`
+      : `${i + 1}. ${order.type}`;
+    embed.addFields({
+      name: orderTitle,
       value: optionsStr
     });
   });
