@@ -31,15 +31,19 @@ let app: admin.app.App;
 try {
   const serviceAccountPath = join(__dirname, 'service-account.json');
 
-  if (process.env.SERVICE_ACCOUNT_JSON) {
-    // Base64-encoded JSON (avoids newline corruption in Railway env vars)
-    const rawJson = Buffer.from(process.env.SERVICE_ACCOUNT_JSON, 'base64').toString('utf8');
-    const serviceAccount = JSON.parse(rawJson);
+  if (process.env.FIREBASE_PRIVATE_KEY && process.env.FIREBASE_CLIENT_EMAIL) {
+    // Individual env vars — most reliable for Railway (no JSON truncation issues)
+    const serviceAccount = {
+      type: 'service_account',
+      project_id: process.env.FIREBASE_PROJECT_ID || appletConfig.projectId,
+      private_key: process.env.FIREBASE_PRIVATE_KEY.replace(/\\n/g, '\n'),
+      client_email: process.env.FIREBASE_CLIENT_EMAIL,
+    };
     app = admin.initializeApp({
-      credential: admin.credential.cert(serviceAccount),
-      projectId: appletConfig.projectId,
+      credential: admin.credential.cert(serviceAccount as admin.ServiceAccount),
+      projectId: process.env.FIREBASE_PROJECT_ID || appletConfig.projectId,
     });
-    console.log('✅ Firebase Admin initialized via SERVICE_ACCOUNT_JSON env var');
+    console.log('✅ Firebase Admin initialized via individual FIREBASE_* env vars');
   } else if (process.env.GOOGLE_APPLICATION_CREDENTIALS) {
     // Explicit path via env var (recommended for production)
     app = admin.initializeApp({
