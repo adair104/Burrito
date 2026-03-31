@@ -1886,13 +1886,20 @@ async function initDiscordBot() {
               const type = state.currentOrder.type;
               const emoji = type.includes('Bowl') ? '🥗' : (type === 'Tacos' ? '🌮' : '🌯');
               const actionText = isEditing ? 'Updating your' : 'Wrapping your';
-              
+
               await interaction.update({ content: `${emoji} ${actionText} ${type.toLowerCase()}...`, components: [], embeds: [] });
               await new Promise(resolve => setTimeout(resolve, 800));
               await interaction.editReply({ content: `✅ Item ${isEditing ? 'updated' : 'added to cart'}!`, components: [], embeds: [] });
               await new Promise(resolve => setTimeout(resolve, 800));
-              
-              await showReview(interaction, state);
+
+              // Auto-advance to next entree if there are still more to add
+              const maxEntrees: number = state.maxEntrees || 8;
+              if (!isEditing && state.orders.length < maxEntrees) {
+                state.currentOrder = { type: '', proteins: [], rice: { type: 'None' }, beans: { type: 'None' }, toppings: [], selectedToppings: [], premiums: [] };
+                await showEntreeSelect(interaction, state);
+              } else {
+                await showReview(interaction, state);
+              }
             } else if (interaction.customId === 'edit_item_select') {
               const index = parseInt(interaction.values[0]);
               state.editingIndex = index;
