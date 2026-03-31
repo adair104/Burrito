@@ -765,19 +765,22 @@ async function initDiscordBot() {
               console.error('Error checking blacklist:', e);
             }
 
-            // Show schedule info before modal
-            const scheduleEmbed = createEmbed(config)
-              .setTitle('🗓️ Before You Order — Queue Info')
-              .setDescription(QUEUE_SCHEDULE_TEXT);
-            const startBtn = new ButtonBuilder()
-              .setCustomId('start_order_modal')
-              .setLabel('🛒 Place My Order')
-              .setStyle(ButtonStyle.Success);
-            const row = new ActionRowBuilder<ButtonBuilder>().addComponents(startBtn);
-            return await interaction.reply({ embeds: [scheduleEmbed], components: [row], flags: MessageFlags.Ephemeral });
+            // TO RE-ENABLE "Before You Order" page: remove the showOrderModal call below,
+            // uncomment the block, and restore the comment about start_order_modal.
+            // const scheduleEmbed = createEmbed(config)
+            //   .setTitle('🗓️ Before You Order — Queue Info')
+            //   .setDescription(QUEUE_SCHEDULE_TEXT);
+            // const startBtn = new ButtonBuilder()
+            //   .setCustomId('start_order_modal')
+            //   .setLabel('🛒 Place My Order')
+            //   .setStyle(ButtonStyle.Success);
+            // const row = new ActionRowBuilder<ButtonBuilder>().addComponents(startBtn);
+            // return await interaction.reply({ embeds: [scheduleEmbed], components: [row], flags: MessageFlags.Ephemeral });
+
+            return await showOrderModal(interaction);
           }
 
-          // (order modal is shown via start_order_modal button — see button handler below)
+          // (order modal can also be shown via start_order_modal button — see button handler below)
 
           if (interaction.commandName === 'config') {
             if (!interaction.memberPermissions?.has('Administrator')) {
