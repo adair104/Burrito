@@ -99,10 +99,21 @@ export async function updateBotConfig(data: any) {
   }
 }
 
+// ── Guild config cache ────────────────────────────────────────────────────────
+// Caches configs in memory for 30 seconds to avoid a Firestore round-trip on
+// every button press / command. Invalidated immediately on write.
+const CONFIG_TTL_MS = 30_000;
+const guildConfigCache = new Map<string, { data: any; expiresAt: number }>();
+
 export async function getGuildConfig(guildId: string) {
+  const cached = guildConfigCache.get(guildId);
+  if (cached && Date.now() < cached.expiresAt) return cached.data;
+
   try {
     const docSnap = await db.collection('guilds').doc(guildId).collection('config').doc('bot').get();
-    return docSnap.exists ? docSnap.data() : null;
+    const data = docSnap.exists ? docSnap.data() : null;
+    guildConfigCache.set(guildId, { data, expiresAt: Date.now() + CONFIG_TTL_MS });
+    return data;
   } catch (error) {
     console.error(`Error getting guild config for ${guildId}:`, error);
     return null;
@@ -112,6 +123,8 @@ export async function getGuildConfig(guildId: string) {
 export async function updateGuildConfig(guildId: string, data: any) {
   try {
     await db.collection('guilds').doc(guildId).collection('config').doc('bot').set(data, { merge: true });
+    // Immediately update cache so next read is consistent without a round-trip
+    guildConfigCache.set(guildId, { data, expiresAt: Date.now() + CONFIG_TTL_MS });
     return true;
   } catch (error) {
     console.error(`Error updating guild config for ${guildId}:`, error);

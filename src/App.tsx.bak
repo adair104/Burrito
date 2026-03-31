@@ -1,0 +1,1532 @@
+import React, { useEffect, useState, useCallback, useRef } from 'react';
+
+// ─── Types ───────────────────────────────────────────────────────────────────
+
+interface DashboardData {
+  bot: { online: boolean; username: string; tag: string; guildCount: number };
+  today: { orders: number; revenue: number; entrees: number; pendingCount: number; pendingRevenue: number; fulfilledCount: number; avgOrderValue: number; statusBreakdown: Record<string, number> };
+  allTime: { orders: number; revenue: number; avgOrderValue: number };
+  topItems: { name: string; count: number }[];
+  topProteins: { name: string; count: number }[];
+  recentOrders: OrderRow[];
+  timestamp: string;
+}
+interface OrderRow { id: string; status: string; total: number; items: string; name: string | null; guildName: string | null; createdAt: string | null; guildId: string | null }
+interface PendingOrder { id: string; shortId: string; status: string; total: number; items: string; name: string | null; phone: string | null; email: string | null; location: string | null; time: string | null; guildName: string | null; guildId: string | null; createdAt: string | null }
+interface TrendDay { date: string; label: string; orders: number; revenue: number; entrees?: number }
+interface ServerStat { guildId: string; name: string; orders: number; revenue: number; pending: number; fulfilled: number; memberCount: number | null; storeOpen: boolean }
+interface Customer { userId: string; orders: number; revenue: number; name: string | null; guildName: string | null }
+interface BlacklistEntry { userId: string; blockedAt: string | null; reason: string | null }
+interface CreditEntry { userId: string; balance: number; lastReason: string | null; lastAdjustment: string | null }
+interface GuildConfig { basePrice?: number; bulkPrice?: number; bulkThreshold?: number; venmoHandle?: string; cashappTag?: string; zelleEmail?: string; cryptoAddress?: string; pausedRounds?: number[]; storeOpen?: boolean }
+
+// ─── Constants ───────────────────────────────────────────────────────────────
+
+const STATUS_STYLES: Record<string, { label: string; classes: string; barColor: string }> = {
+  paid_fulfilled: { label: 'Fulfilled',  classes: 'bg-emerald-500/10 text-emerald-400 border-emerald-500/20', barColor: 'bg-emerald-500' },
+  paid:           { label: 'Paid',       classes: 'bg-blue-500/10 text-blue-400 border-blue-500/20',          barColor: 'bg-blue-500' },
+  pending:        { label: 'Pending',    classes: 'bg-amber-500/10 text-amber-400 border-amber-500/20',       barColor: 'bg-amber-500' },
+  pending_venmo:  { label: 'Venmo',      classes: 'bg-sky-500/10 text-sky-400 border-sky-500/20',             barColor: 'bg-sky-500' },
+  pending_cashapp:{ label: 'Cash App',   classes: 'bg-lime-500/10 text-lime-400 border-lime-500/20',          barColor: 'bg-lime-500' },
+  pending_zelle:  { label: 'Zelle',      classes: 'bg-violet-500/10 text-violet-400 border-violet-500/20',    barColor: 'bg-violet-500' },
+  pending_crypto: { label: 'Crypto',     classes: 'bg-yellow-500/10 text-yellow-400 border-yellow-500/20',    barColor: 'bg-yellow-500' },
+  cancelled:      { label: 'Cancelled',  classes: 'bg-red-500/10 text-red-400 border-red-500/20',             barColor: 'bg-red-500' },
+};
+const ITEM_ICONS: Record<string, string> = { Burrito: '🌯', Bowl: '🥣', Tacos: '🌮', Salad: '🥗', Quesadilla: '🫓', Quesabirria: '🫕' };
+const PROTEIN_ICONS: Record<string, string> = { Chicken: '🍗', Steak: '🥩', Barbacoa: '🫕', Carnitas: '🐷', Sofritas: '🌿', Fajita: '🫑', 'Double Chicken': '🍗', 'Double Steak': '🥩' };
+const ROUND_SCHEDULE = [
+  { num: 1, open: '6:45 AM', placement: '8:45 AM', pickup: '9:30 AM' },
+  { num: 2, open: '9:45 AM', placement: '11:45 AM', pickup: '12:30 PM' },
+  { num: 3, open: '12:45 PM', placement: '2:45 PM', pickup: '3:30 PM' },
+  { num: 4, open: '2:45 PM', placement: '4:45 PM', pickup: '5:30 PM' },
+];
+
+// ─── Utilities ────────────────────────────────────────────────────────────────
+
+function timeAgo(iso: string | null): string {
+  if (!iso) return '—';
+  const diff = (Date.now() - new Date(iso).getTime()) / 1000;
+  if (diff < 60) return `${Math.floor(diff)}s ago`;
+  if (diff < 3600) return `${Math.floor(diff / 60)}m ago`;
+  if (diff < 86400) return `${Math.floor(diff / 3600)}h ago`;
+  return new Date(iso).toLocaleDateString();
+}
+function fmtMoney(n: number) { return `$${n.toFixed(2)}`; }
+async function api(path: string, opts?: RequestInit) {
+  const res = await fetch(path, opts);
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}));
+    throw new Error(body.error || `HTTP ${res.status}`);
+  }
+  return res.json();
+}
+
+// ─── Shared Components ────────────────────────────────────────────────────────
+
+function StatusBadge({ status }: { status: string }) {
+  const s = STATUS_STYLES[status] || { label: status, classes: 'bg-violet-900/40 text-violet-300 border-violet-700/40' };
+  return <span className={`inline-flex items-center px-2 py-0.5 rounded-md text-xs font-medium border ${s.classes}`}>{s.label}</span>;
+}
+function StatCard({ label, value, sub, accent }: { label: string; value: string; sub?: string; accent?: string }) {
+  return (
+    <div className="bg-[#130E26] border border-[#2A1B50] rounded-2xl p-5 flex flex-col gap-1">
+      <span className="text-violet-400/60 text-xs font-medium uppercase tracking-wider">{label}</span>
+      <span className={`text-2xl font-semibold tabular-nums ${accent || 'text-white'}`}>{value}</span>
+      {sub && <span className="text-violet-400/50 text-xs">{sub}</span>}
+    </div>
+  );
+}
+function Card({ children, className = '' }: { children: React.ReactNode; className?: string }) {
+  return <div className={`bg-[#130E26] border border-[#2A1B50] rounded-2xl ${className}`}>{children}</div>;
+}
+function SectionHeader({ children, action }: { children: React.ReactNode; action?: React.ReactNode }) {
+  return (
+    <div className="flex items-center justify-between mb-3">
+      <h2 className="text-xs font-medium text-violet-400/60 uppercase tracking-wider">{children}</h2>
+      {action}
+    </div>
+  );
+}
+function Btn({ children, onClick, variant = 'default', disabled, className = '', size = 'sm' }: { children: React.ReactNode; onClick?: () => void; variant?: 'default' | 'success' | 'danger' | 'ghost' | 'primary'; disabled?: boolean; className?: string; size?: 'sm' | 'xs' }) {
+  const variants = {
+    default:  'border-[#2A1B50] text-violet-300 hover:border-violet-600 hover:text-white',
+    primary:  'border-violet-600 bg-violet-600/20 text-violet-300 hover:bg-violet-600/40',
+    success:  'border-emerald-600/40 text-emerald-400 hover:bg-emerald-500/10 hover:border-emerald-500',
+    danger:   'border-red-600/40 text-red-400 hover:bg-red-500/10 hover:border-red-500',
+    ghost:    'border-transparent text-violet-400/60 hover:text-violet-300',
+  };
+  const sizes = { sm: 'text-xs px-3 py-1.5', xs: 'text-xs px-2 py-1' };
+  return (
+    <button onClick={onClick} disabled={disabled} className={`border rounded-lg transition-all disabled:opacity-40 disabled:cursor-not-allowed ${variants[variant]} ${sizes[size]} ${className}`}>
+      {children}
+    </button>
+  );
+}
+function EmptyState({ icon, text }: { icon: string; text: string }) {
+  return (
+    <div className="flex flex-col items-center justify-center py-14 text-violet-400/40 gap-2">
+      <span className="text-3xl">{icon}</span>
+      <span className="text-sm">{text}</span>
+    </div>
+  );
+}
+function Toast({ msg, type }: { msg: string; type: 'ok' | 'err' }) {
+  return (
+    <div className={`fixed bottom-6 right-6 z-50 px-4 py-3 rounded-xl border text-sm shadow-xl ${type === 'ok' ? 'bg-emerald-900/80 border-emerald-600/40 text-emerald-300' : 'bg-red-900/80 border-red-600/40 text-red-300'}`}>
+      {msg}
+    </div>
+  );
+}
+
+function useToast() {
+  const [toast, setToast] = useState<{ msg: string; type: 'ok' | 'err' } | null>(null);
+  const show = useCallback((msg: string, type: 'ok' | 'err' = 'ok') => {
+    setToast({ msg, type });
+    setTimeout(() => setToast(null), 3000);
+  }, []);
+  return { toast, show };
+}
+
+// ─── Charts ───────────────────────────────────────────────────────────────────
+
+function HorizBar({ items, iconMap }: { items: { name: string; count: number }[]; iconMap: Record<string, string> }) {
+  if (!items.length) return <EmptyState icon="📋" text="No data yet." />;
+  const max = items[0]?.count || 1;
+  return (
+    <div className="space-y-2.5">
+      {items.map((item, i) => (
+        <div key={item.name} className="flex items-center gap-3">
+          <span className="text-violet-400/40 text-xs w-4 text-right">{i + 1}</span>
+          <span className="text-base">{iconMap[item.name] || '•'}</span>
+          <span className="text-violet-200/80 text-sm w-32 truncate">{item.name}</span>
+          <div className="flex-1 bg-[#1E1540] rounded-full h-1.5">
+            <div className="bg-violet-500 h-1.5 rounded-full" style={{ width: `${(item.count / max) * 100}%` }} />
+          </div>
+          <span className="text-violet-400/60 text-xs w-6 text-right">{item.count}</span>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function BarChart({ days, valueKey, label, color }: { days: TrendDay[]; valueKey: 'revenue' | 'orders' | 'entrees'; label: string; color: string }) {
+  if (!days.length) return <EmptyState icon="📈" text="No data." />;
+  const vals = days.map(d => ((d as any)[valueKey] as number) || 0);
+  const max = Math.max(...vals, 1);
+  const total = vals.reduce((a, b) => a + b, 0);
+  return (
+    <div>
+      <div className="flex items-center justify-between mb-3">
+        <p className="text-violet-400/50 text-xs uppercase tracking-wider">{label}</p>
+        <span className="text-violet-200 text-xs font-medium">
+          {valueKey === 'revenue' ? fmtMoney(total) : total}
+        </span>
+      </div>
+      <div className="flex items-end gap-1.5 h-24">
+        {days.map((d, i) => {
+          const v = (d as any)[valueKey] as number;
+          const h = Math.max(v > 0 ? (v / max) * 100 : 0, v > 0 ? 3 : 0);
+          const isToday = i === days.length - 1;
+          return (
+            <div key={d.date} className="flex-1 flex flex-col items-center gap-1 group relative">
+              <div className="absolute -top-10 left-1/2 -translate-x-1/2 bg-[#2A1B50] text-white text-xs px-2 py-1.5 rounded-lg opacity-0 group-hover:opacity-100 transition-opacity whitespace-nowrap z-10 pointer-events-none shadow-xl">
+                <p className="font-medium">{d.label}</p>
+                <p>{valueKey === 'revenue' ? fmtMoney(v) : `${v} ${valueKey}`}</p>
+              </div>
+              <div className="w-full flex items-end" style={{ height: '5.5rem' }}>
+                <div className={`w-full rounded-t transition-all ${isToday ? color : `${color} opacity-30 group-hover:opacity-50`}`} style={{ height: `${h}%` }} />
+              </div>
+              <span className="text-violet-400/40 truncate w-full text-center" style={{ fontSize: '0.6rem' }}>
+                {d.label.split(' ').slice(0, 2).join(' ')}
+              </span>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+function StatusBreakdown({ breakdown }: { breakdown: Record<string, number> }) {
+  const total = Object.values(breakdown).reduce((a, b) => a + b, 0);
+  if (!total) return <EmptyState icon="📊" text="No orders today." />;
+  const ORDER = ['paid_fulfilled', 'paid', 'pending', 'pending_venmo', 'pending_cashapp', 'pending_zelle', 'pending_crypto', 'cancelled'];
+  const items = ORDER.filter(k => breakdown[k] > 0).map(k => ({
+    key: k, label: STATUS_STYLES[k]?.label || k,
+    color: STATUS_STYLES[k]?.barColor || 'bg-violet-500',
+    count: breakdown[k], pct: Math.round((breakdown[k] / total) * 100),
+  }));
+  return (
+    <div className="space-y-3">
+      <div className="flex rounded-full overflow-hidden h-3 gap-0.5">
+        {items.map(item => (
+          <div key={item.key} className={`${item.color} h-3 rounded-full`} style={{ width: `${item.pct}%` }} title={`${item.label}: ${item.count}`} />
+        ))}
+      </div>
+      <div className="flex flex-wrap gap-x-5 gap-y-2">
+        {items.map(item => (
+          <div key={item.key} className="flex items-center gap-1.5">
+            <div className={`w-2 h-2 rounded-full flex-shrink-0 ${item.color}`} />
+            <span className="text-violet-300/60 text-xs">{item.label}</span>
+            <span className="text-violet-200/80 text-xs font-medium">{item.count}</span>
+            <span className="text-violet-400/40 text-xs">({item.pct}%)</span>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// ─── Orders Tab ───────────────────────────────────────────────────────────────
+
+function PendingPanel({ onAction }: { onAction: () => void }) {
+  const [orders, setOrders] = useState<PendingOrder[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [acting, setActing] = useState<string | null>(null);
+  const [expanded, setExpanded] = useState<string | null>(null);
+  const { toast, show } = useToast();
+
+  const load = useCallback(async () => {
+    setLoading(true);
+    try { const d = await api('/api/dashboard/pending'); setOrders(d.orders || []); } catch { /**/ }
+    setLoading(false);
+  }, []);
+
+  useEffect(() => { load(); }, [load]);
+
+  async function act(id: string, action: 'fulfill' | 'cancel') {
+    if (action === 'cancel' && !confirm('Cancel this order?')) return;
+    setActing(id);
+    try {
+      await api(`/api/dashboard/orders/${id}/${action}`, { method: 'POST' });
+      show(action === 'fulfill' ? '✓ Order fulfilled' : '✕ Order cancelled');
+      await load(); onAction();
+    } catch (e: any) { show(e.message, 'err'); }
+    setActing(null);
+  }
+
+  if (loading) return <EmptyState icon="⏳" text="Loading…" />;
+  if (!orders.length) return <EmptyState icon="✅" text="No pending orders right now." />;
+
+  return (
+    <>
+      {toast && <Toast {...toast} />}
+      <div className="flex justify-between items-center mb-2">
+        <span className="text-violet-400/60 text-xs">{orders.length} pending</span>
+        <Btn onClick={load} variant="ghost">↻ Refresh</Btn>
+      </div>
+      <div className="space-y-2">
+        {orders.map(o => (
+          <Card key={o.id} className="overflow-hidden">
+            <div className="px-4 py-3 flex items-center gap-3 cursor-pointer hover:bg-violet-900/10" onClick={() => setExpanded(expanded === o.id ? null : o.id)}>
+              <span className="font-mono text-violet-300 text-xs bg-[#1E1540] px-2 py-1 rounded">#{o.shortId}</span>
+              <div className="flex-1 min-w-0">
+                <div className="flex items-center gap-2"><span className="text-violet-200/80 text-sm font-medium">{o.name || '—'}</span>{o.guildName && <span className="text-violet-400/40 text-xs">· {o.guildName}</span>}</div>
+                <span className="text-violet-400/50 text-xs truncate block">{o.items}</span>
+              </div>
+              <StatusBadge status={o.status} />
+              <span className="text-violet-100 tabular-nums text-sm">{fmtMoney(o.total)}</span>
+              <span className="text-violet-400/40 text-xs">{timeAgo(o.createdAt)}</span>
+              <span className="text-violet-400/40 text-xs">{expanded === o.id ? '▲' : '▼'}</span>
+            </div>
+            {expanded === o.id && (
+              <div className="border-t border-[#2A1B50] px-4 py-3 bg-[#0D0A1A]/50 space-y-3">
+                <div className="grid grid-cols-2 sm:grid-cols-3 gap-3 text-xs">
+                  {o.phone && <div><span className="text-violet-400/50">Phone</span><p className="text-violet-200 mt-0.5">{o.phone}</p></div>}
+                  {o.email && <div><span className="text-violet-400/50">Email</span><p className="text-violet-200 mt-0.5 truncate">{o.email}</p></div>}
+                  {o.location && <div className="col-span-2"><span className="text-violet-400/50">Location</span><p className="text-violet-200 mt-0.5">{o.location}</p></div>}
+                  {o.time && <div><span className="text-violet-400/50">Pickup</span><p className="text-violet-200 mt-0.5">{o.time}</p></div>}
+                  <div><span className="text-violet-400/50">Full ID</span><p className="text-violet-400/60 font-mono mt-0.5 text-xs break-all">{o.id}</p></div>
+                </div>
+                <div className="flex gap-2">
+                  <Btn variant="success" onClick={() => act(o.id, 'fulfill')} disabled={acting === o.id}>{acting === o.id ? '…' : '✓ Fulfill'}</Btn>
+                  <Btn variant="danger" onClick={() => act(o.id, 'cancel')} disabled={acting === o.id}>✕ Cancel</Btn>
+                </div>
+              </div>
+            )}
+          </Card>
+        ))}
+      </div>
+    </>
+  );
+}
+
+function AllOrdersPanel({ orders }: { orders: OrderRow[] }) {
+  const [filter, setFilter] = useState('all');
+  const [search, setSearch] = useState('');
+  const { toast, show } = useToast();
+
+  const filtered = orders.filter(o => {
+    const matchStatus = filter === 'all' || o.status === filter || (filter === 'pending' && o.status.startsWith('pending'));
+    const q = search.toLowerCase();
+    return matchStatus && (!q || [o.name, o.id, o.items, o.guildName].some(v => v?.toLowerCase().includes(q)));
+  });
+
+  return (
+    <>
+      {toast && <Toast {...toast} />}
+      <div className="flex flex-col sm:flex-row gap-3 mb-3">
+        <input type="text" placeholder="Search name, order ID, items, server…" value={search} onChange={e => setSearch(e.target.value)}
+          className="flex-1 bg-[#130E26] border border-[#2A1B50] rounded-xl px-4 py-2 text-sm text-violet-200 placeholder-violet-400/40 focus:outline-none focus:border-violet-600" />
+        <div className="flex gap-1.5 flex-wrap">
+          {['all', 'pending', 'paid', 'paid_fulfilled', 'cancelled'].map(s => (
+            <button key={s} onClick={() => setFilter(s)} className={`text-xs px-3 py-1.5 rounded-lg border transition-all capitalize ${filter === s ? 'bg-violet-600 border-violet-600 text-white' : 'bg-[#130E26] border-[#2A1B50] text-violet-400/60 hover:border-violet-600/50'}`}>
+              {STATUS_STYLES[s]?.label || 'All'}
+            </button>
+          ))}
+        </div>
+      </div>
+      <Card className="overflow-hidden">
+        {!filtered.length ? <EmptyState icon="🔍" text="No orders match." /> : (
+          <div className="overflow-x-auto">
+            <table className="w-full text-sm">
+              <thead><tr className="border-b border-[#2A1B50]">
+                {['Order', 'Customer', 'Items', 'Status', 'Total', 'Time'].map(h => (
+                  <th key={h} className={`text-left text-violet-400/60 text-xs font-medium px-4 py-3 uppercase tracking-wider ${h === 'Items' ? 'hidden md:table-cell' : h === 'Time' ? 'hidden lg:table-cell' : ''}`}>{h}</th>
+                ))}
+              </tr></thead>
+              <tbody className="divide-y divide-[#2A1B50]/60">
+                {filtered.map(o => (
+                  <tr key={o.id} className="hover:bg-violet-900/10">
+                    <td className="px-4 py-3"><span className="font-mono text-violet-300 text-xs bg-[#1E1540] px-2 py-1 rounded">#{o.id}</span></td>
+                    <td className="px-4 py-3"><p className="text-violet-200/80 text-xs font-medium">{o.name || '—'}</p>{o.guildName && <p className="text-violet-400/40 text-xs">{o.guildName}</p>}</td>
+                    <td className="px-4 py-3 text-violet-200/60 hidden md:table-cell max-w-[160px]"><span className="truncate block text-xs">{o.items}</span></td>
+                    <td className="px-4 py-3"><StatusBadge status={o.status} /></td>
+                    <td className="px-4 py-3 text-violet-100 tabular-nums">{fmtMoney(o.total)}</td>
+                    <td className="px-4 py-3 text-violet-400/50 text-xs hidden lg:table-cell whitespace-nowrap">{timeAgo(o.createdAt)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </Card>
+    </>
+  );
+}
+
+// ─── Servers Tab ──────────────────────────────────────────────────────────────
+
+function ServersPanel() {
+  const [servers, setServers] = useState<ServerStat[]>([]);
+  const [configs, setConfigs] = useState<Record<string, GuildConfig>>({});
+  const [loading, setLoading] = useState(true);
+  const [expanded, setExpanded] = useState<string | null>(null);
+  const [toggling, setToggling] = useState<string | null>(null);
+  const [acting, setActing] = useState<string | null>(null);
+  const [priceForm, setPriceForm] = useState<Record<string, { base: string; bulkPrice: string; bulkThreshold: string }>>({});
+  const [paymentForm, setPaymentForm] = useState<Record<string, { venmo: string; cashapp: string; zelle: string; crypto: string }>>({});
+  const { toast, show } = useToast();
+
+  const load = useCallback(async () => {
+    setLoading(true);
+    try {
+      const d = await api('/api/dashboard/servers');
+      setServers(d.servers || []);
+      const cfgs: Record<string, GuildConfig> = {};
+      await Promise.all((d.servers || []).map(async (s: ServerStat) => {
+        try { const c = await api(`/api/dashboard/config/${s.guildId}`); cfgs[s.guildId] = c.config; } catch { /**/ }
+      }));
+      setConfigs(cfgs);
+    } catch { /**/ }
+    setLoading(false);
+  }, []);
+
+  useEffect(() => { load(); }, [load]);
+
+  async function toggleStore(guildId: string) {
+    setToggling(guildId);
+    try { await api(`/api/dashboard/servers/${guildId}/toggle`, { method: 'POST' }); await load(); show('Store status updated'); } catch (e: any) { show(e.message, 'err'); }
+    setToggling(null);
+  }
+
+  async function fulfillAll(guildId: string, name: string) {
+    if (!confirm(`Fulfill all paid orders for ${name}?`)) return;
+    setActing(`fulfill:${guildId}`);
+    try {
+      const d = await api(`/api/dashboard/servers/${guildId}/fulfillall`, { method: 'POST' });
+      show(`✓ Fulfilled ${d.fulfilled} orders`); await load();
+    } catch (e: any) { show(e.message, 'err'); }
+    setActing(null);
+  }
+
+  async function toggleRound(guildId: string, round: number, paused: boolean) {
+    setActing(`round:${guildId}:${round}`);
+    try {
+      await api(`/api/dashboard/servers/${guildId}/rounds`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ round, action: paused ? 'resume' : 'pause' }) });
+      show(`Round ${round} ${paused ? 'resumed' : 'paused'}`); await load();
+    } catch (e: any) { show(e.message, 'err'); }
+    setActing(null);
+  }
+
+  async function savePrice(guildId: string) {
+    const f = priceForm[guildId];
+    if (!f) return;
+    setActing(`price:${guildId}`);
+    try {
+      const body: any = {};
+      if (f.base) body.basePrice = parseFloat(f.base);
+      if (f.bulkPrice) body.bulkPrice = parseFloat(f.bulkPrice);
+      if (f.bulkThreshold) body.bulkThreshold = parseInt(f.bulkThreshold, 10);
+      await api(`/api/dashboard/config/${guildId}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+      show('✓ Prices saved'); await load();
+    } catch (e: any) { show(e.message, 'err'); }
+    setActing(null);
+  }
+
+  async function savePayment(guildId: string) {
+    const f = paymentForm[guildId];
+    if (!f) return;
+    setActing(`pay:${guildId}`);
+    try {
+      const body: any = {};
+      if (f.venmo) body.venmoHandle = f.venmo;
+      if (f.cashapp) body.cashappTag = f.cashapp;
+      if (f.zelle) body.zelleEmail = f.zelle;
+      if (f.crypto) body.cryptoAddress = f.crypto;
+      await api(`/api/dashboard/config/${guildId}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+      show('✓ Payment methods saved'); await load();
+    } catch (e: any) { show(e.message, 'err'); }
+    setActing(null);
+  }
+
+  if (loading) return <EmptyState icon="⏳" text="Loading…" />;
+  if (!servers.length) return <EmptyState icon="🌐" text="No servers found." />;
+
+  return (
+    <>
+      {toast && <Toast {...toast} />}
+      <div className="space-y-3">
+        {servers.map(s => {
+          const cfg = configs[s.guildId] || {};
+          const pausedRounds: number[] = cfg.pausedRounds || [];
+          const pf = priceForm[s.guildId] || { base: String(cfg.basePrice || ''), bulkPrice: String(cfg.bulkPrice || ''), bulkThreshold: String(cfg.bulkThreshold || '') };
+          const payf = paymentForm[s.guildId] || { venmo: cfg.venmoHandle || '', cashapp: cfg.cashappTag || '', zelle: cfg.zelleEmail || '', crypto: cfg.cryptoAddress || '' };
+
+          return (
+            <Card key={s.guildId} className="overflow-hidden">
+              <div className="px-5 py-4 flex items-start gap-4">
+                <div className="w-10 h-10 bg-violet-600/10 border border-violet-600/20 rounded-xl flex items-center justify-center text-lg">🌐</div>
+                <div className="flex-1 min-w-0">
+                  <div className="flex items-center gap-2 flex-wrap mb-1">
+                    <span className="font-semibold text-white text-sm">{s.name}</span>
+                    {s.memberCount !== null && <span className="text-violet-400/40 text-xs">{s.memberCount.toLocaleString()} members</span>}
+                    <div className={`flex items-center gap-1 px-2 py-0.5 rounded-full text-xs border ml-auto ${s.storeOpen ? 'bg-emerald-500/10 text-emerald-400 border-emerald-500/20' : 'bg-red-500/10 text-red-400 border-red-500/20'}`}>
+                      <div className={`w-1.5 h-1.5 rounded-full ${s.storeOpen ? 'bg-emerald-400' : 'bg-red-400'}`} />
+                      {s.storeOpen ? 'Open' : 'Closed'}
+                    </div>
+                  </div>
+                  <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 mt-2">
+                    {[{ l: 'Orders', v: String(s.orders) }, { l: 'Revenue', v: fmtMoney(s.revenue) }, { l: 'Pending', v: String(s.pending), a: s.pending > 0 ? 'text-amber-400' : undefined }, { l: 'Fulfilled', v: String(s.fulfilled), a: s.fulfilled > 0 ? 'text-emerald-400' : undefined }].map(item => (
+                      <div key={item.l}><p className="text-violet-400/50 text-xs">{item.l}</p><p className={`font-medium tabular-nums text-sm ${item.a || 'text-violet-200'}`}>{item.v}</p></div>
+                    ))}
+                  </div>
+                </div>
+              </div>
+
+              {/* Quick actions */}
+              <div className="px-5 pb-3 flex gap-2 flex-wrap">
+                <Btn variant={s.storeOpen ? 'danger' : 'success'} onClick={() => toggleStore(s.guildId)} disabled={toggling === s.guildId}>
+                  {toggling === s.guildId ? '…' : s.storeOpen ? '🔒 Close Store' : '🔓 Open Store'}
+                </Btn>
+                <Btn variant="primary" onClick={() => fulfillAll(s.guildId, s.name)} disabled={acting === `fulfill:${s.guildId}`}>
+                  {acting === `fulfill:${s.guildId}` ? '…' : '✓ Fulfill All Paid'}
+                </Btn>
+                <a href={`/api/dashboard/export.csv?guildId=${s.guildId}`} download className="text-xs border border-[#2A1B50] text-violet-300 hover:border-violet-600 px-3 py-1.5 rounded-lg transition-all">
+                  ↓ Export CSV
+                </a>
+                <Btn variant="ghost" onClick={() => setExpanded(expanded === s.guildId ? null : s.guildId)}>
+                  {expanded === s.guildId ? '▲ Less' : '▼ Settings'}
+                </Btn>
+              </div>
+
+              {expanded === s.guildId && (
+                <div className="border-t border-[#2A1B50] px-5 py-4 bg-[#0D0A1A]/50 space-y-6">
+
+                  {/* Round management */}
+                  <div>
+                    <p className="text-violet-400/50 text-xs uppercase tracking-wider mb-3">Round Management</p>
+                    <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+                      {ROUND_SCHEDULE.map(r => {
+                        const isPaused = pausedRounds.includes(r.num);
+                        const key = `round:${s.guildId}:${r.num}`;
+                        return (
+                          <div key={r.num} className={`rounded-xl border p-3 ${isPaused ? 'border-red-500/20 bg-red-500/5' : 'border-[#2A1B50]'}`}>
+                            <p className="text-violet-300 text-xs font-medium mb-0.5">Round {r.num}</p>
+                            <p className="text-violet-400/40 text-xs">Opens {r.open}</p>
+                            <p className="text-violet-400/40 text-xs mb-2">Pickup {r.pickup}</p>
+                            <Btn size="xs" variant={isPaused ? 'success' : 'danger'} onClick={() => toggleRound(s.guildId, r.num, isPaused)} disabled={acting === key}>
+                              {acting === key ? '…' : isPaused ? '▶ Resume' : '⏸ Pause'}
+                            </Btn>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+
+                  {/* Price settings */}
+                  <div>
+                    <p className="text-violet-400/50 text-xs uppercase tracking-wider mb-3">Pricing</p>
+                    <div className="grid grid-cols-3 gap-3">
+                      {[
+                        { label: 'Base Price ($)', key: 'base', placeholder: cfg.basePrice?.toFixed(2) || '5.00' },
+                        { label: 'Bulk Price ($)', key: 'bulkPrice', placeholder: cfg.bulkPrice?.toFixed(2) || 'e.g. 4.00' },
+                        { label: 'Bulk Threshold', key: 'bulkThreshold', placeholder: cfg.bulkThreshold?.toString() || 'e.g. 3' },
+                      ].map(f => (
+                        <div key={f.key}>
+                          <label className="text-violet-400/50 text-xs block mb-1">{f.label}</label>
+                          <input
+                            type="number" step="0.01" placeholder={f.placeholder}
+                            value={(pf as any)[f.key]}
+                            onChange={e => setPriceForm(p => ({ ...p, [s.guildId]: { ...pf, [f.key]: e.target.value } }))}
+                            className="w-full bg-[#130E26] border border-[#2A1B50] rounded-lg px-3 py-2 text-sm text-violet-200 placeholder-violet-400/30 focus:outline-none focus:border-violet-600"
+                          />
+                        </div>
+                      ))}
+                    </div>
+                    <Btn className="mt-2" variant="primary" onClick={() => savePrice(s.guildId)} disabled={acting === `price:${s.guildId}`}>
+                      {acting === `price:${s.guildId}` ? '…' : 'Save Prices'}
+                    </Btn>
+                  </div>
+
+                  {/* Payment methods */}
+                  <div>
+                    <p className="text-violet-400/50 text-xs uppercase tracking-wider mb-3">Payment Methods</p>
+                    <div className="grid grid-cols-2 gap-3">
+                      {[
+                        { label: 'Venmo Handle', key: 'venmo', placeholder: '@username' },
+                        { label: 'Cash App $tag', key: 'cashapp', placeholder: '$cashtag' },
+                        { label: 'Zelle Email/Phone', key: 'zelle', placeholder: 'email or phone' },
+                        { label: 'Crypto Address', key: 'crypto', placeholder: 'wallet address' },
+                      ].map(f => (
+                        <div key={f.key}>
+                          <label className="text-violet-400/50 text-xs block mb-1">{f.label}</label>
+                          <input
+                            type="text" placeholder={f.placeholder}
+                            value={(payf as any)[f.key]}
+                            onChange={e => setPaymentForm(p => ({ ...p, [s.guildId]: { ...payf, [f.key]: e.target.value } }))}
+                            className="w-full bg-[#130E26] border border-[#2A1B50] rounded-lg px-3 py-2 text-sm text-violet-200 placeholder-violet-400/30 focus:outline-none focus:border-violet-600"
+                          />
+                        </div>
+                      ))}
+                    </div>
+                    <Btn className="mt-2" variant="primary" onClick={() => savePayment(s.guildId)} disabled={acting === `pay:${s.guildId}`}>
+                      {acting === `pay:${s.guildId}` ? '…' : 'Save Payment Methods'}
+                    </Btn>
+                  </div>
+
+                </div>
+              )}
+            </Card>
+          );
+        })}
+      </div>
+    </>
+  );
+}
+
+// ─── Analytics Tab ────────────────────────────────────────────────────────────
+
+function AnalyticsPanel({ topItems, topProteins, statusBreakdown }: { topItems: { name: string; count: number }[]; topProteins: { name: string; count: number }[]; statusBreakdown: Record<string, number> }) {
+  const [revDays, setRevDays] = useState<TrendDay[]>([]);
+  const [period, setPeriod] = useState<7 | 30 | 90>(30);
+  const [customers, setCustomers] = useState<Customer[]>([]);
+  const [loadingRev, setLoadingRev] = useState(false);
+  const [loadingCust, setLoadingCust] = useState(false);
+
+  useEffect(() => {
+    setLoadingRev(true);
+    api(`/api/dashboard/revenue?days=${period}`).then(d => { setRevDays(d.days || []); setLoadingRev(false); }).catch(() => setLoadingRev(false));
+  }, [period]);
+
+  useEffect(() => {
+    setLoadingCust(true);
+    api('/api/dashboard/customers').then(d => { setCustomers(d.customers || []); setLoadingCust(false); }).catch(() => setLoadingCust(false));
+  }, []);
+
+  return (
+    <div className="space-y-8">
+      {/* Revenue chart */}
+      <div>
+        <SectionHeader action={
+          <div className="flex gap-1">
+            {([7, 30, 90] as const).map(p => (
+              <button key={p} onClick={() => setPeriod(p)} className={`text-xs px-2.5 py-1 rounded-lg border transition-all ${period === p ? 'bg-violet-600 border-violet-600 text-white' : 'border-[#2A1B50] text-violet-400/60'}`}>{p}d</button>
+            ))}
+          </div>
+        }>Revenue Trend</SectionHeader>
+        <Card className="p-5 space-y-5">
+          {loadingRev ? <EmptyState icon="⏳" text="Loading…" /> : (
+            <>
+              <BarChart days={revDays} valueKey="revenue" label="Revenue" color="bg-violet-500" />
+              <BarChart days={revDays} valueKey="orders" label="Orders" color="bg-blue-500" />
+              <BarChart days={revDays} valueKey="entrees" label="Entrees" color="bg-emerald-500" />
+            </>
+          )}
+        </Card>
+      </div>
+
+      {/* Item & protein charts */}
+      <div className="grid grid-cols-1 sm:grid-cols-2 gap-6">
+        <div>
+          <SectionHeader>Top Items — Today</SectionHeader>
+          <Card className="p-5"><HorizBar items={topItems} iconMap={ITEM_ICONS} /></Card>
+        </div>
+        <div>
+          <SectionHeader>Top Proteins — Today</SectionHeader>
+          <Card className="p-5"><HorizBar items={topProteins} iconMap={PROTEIN_ICONS} /></Card>
+        </div>
+      </div>
+
+      {/* Status breakdown */}
+      {Object.values(statusBreakdown).some(v => v > 0) && (
+        <div>
+          <SectionHeader>Order Status Distribution — Today</SectionHeader>
+          <Card className="p-5"><StatusBreakdown breakdown={statusBreakdown} /></Card>
+        </div>
+      )}
+
+      {/* Customer leaderboard */}
+      <div>
+        <SectionHeader>Top Customers — All Time</SectionHeader>
+        <Card className="overflow-hidden">
+          {loadingCust ? <EmptyState icon="⏳" text="Loading…" /> : !customers.length ? <EmptyState icon="👥" text="No customers yet." /> : (
+            <div className="overflow-x-auto">
+              <table className="w-full text-sm">
+                <thead><tr className="border-b border-[#2A1B50]">
+                  {['#', 'Customer', 'Server', 'Orders', 'Spent'].map(h => (
+                    <th key={h} className="text-left text-violet-400/60 text-xs font-medium px-4 py-3 uppercase tracking-wider">{h}</th>
+                  ))}
+                </tr></thead>
+                <tbody className="divide-y divide-[#2A1B50]/60">
+                  {customers.map((c, i) => (
+                    <tr key={`${c.userId}-${i}`} className="hover:bg-violet-900/10">
+                      <td className="px-4 py-3 text-violet-400/40 text-xs tabular-nums">{i + 1}</td>
+                      <td className="px-4 py-3">
+                        <p className="text-violet-200/80 text-sm font-medium">{c.name || 'Unknown'}</p>
+                        <p className="text-violet-400/40 text-xs font-mono">{c.userId}</p>
+                      </td>
+                      <td className="px-4 py-3 text-violet-300/60 text-xs">{c.guildName || '—'}</td>
+                      <td className="px-4 py-3 text-violet-200 tabular-nums font-medium">{c.orders}</td>
+                      <td className="px-4 py-3 text-violet-200 tabular-nums">{fmtMoney(c.revenue)}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </Card>
+      </div>
+    </div>
+  );
+}
+
+// ─── Tools Tab ────────────────────────────────────────────────────────────────
+
+function ToolsPanel() {
+  const [servers, setServers] = useState<ServerStat[]>([]);
+  const [selectedGuild, setSelectedGuild] = useState('');
+  const [blacklist, setBlacklist] = useState<BlacklistEntry[]>([]);
+  const [credits, setCredits] = useState<CreditEntry[]>([]);
+  const [creditUserId, setCreditUserId] = useState('');
+  const [creditAmount, setCreditAmount] = useState('');
+  const [creditReason, setCreditReason] = useState('');
+  const [dmUserId, setDmUserId] = useState('');
+  const [dmMessage, setDmMessage] = useState('');
+  const [loadingBL, setLoadingBL] = useState(false);
+  const [loadingCR, setLoadingCR] = useState(false);
+  const [acting, setActing] = useState<string | null>(null);
+  const { toast, show } = useToast();
+
+  useEffect(() => {
+    api('/api/dashboard/servers').then(d => {
+      const s = d.servers || [];
+      setServers(s);
+      if (s.length > 0) setSelectedGuild(s[0].guildId);
+    }).catch(() => { /**/ });
+  }, []);
+
+  useEffect(() => {
+    if (!selectedGuild) return;
+    setLoadingBL(true); setLoadingCR(true);
+    api(`/api/dashboard/blacklist/${selectedGuild}`).then(d => { setBlacklist(d.entries || []); setLoadingBL(false); }).catch(() => setLoadingBL(false));
+    api(`/api/dashboard/credits/${selectedGuild}`).then(d => { setCredits(d.credits || []); setLoadingCR(false); }).catch(() => setLoadingCR(false));
+  }, [selectedGuild]);
+
+  async function unblacklist(userId: string) {
+    setActing(`bl:${userId}`);
+    try {
+      await api(`/api/dashboard/blacklist/${selectedGuild}/${userId}`, { method: 'DELETE' });
+      setBlacklist(b => b.filter(x => x.userId !== userId));
+      show('✓ User unblocked');
+    } catch (e: any) { show(e.message, 'err'); }
+    setActing(null);
+  }
+
+  async function adjustCredit() {
+    if (!creditUserId || !creditAmount) return;
+    setActing('credit');
+    try {
+      const d = await api(`/api/dashboard/credits/${selectedGuild}/${creditUserId}`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ amount: parseFloat(creditAmount), reason: creditReason }),
+      });
+      show(`✓ New balance: ${fmtMoney(d.balance)}`);
+      setCreditUserId(''); setCreditAmount(''); setCreditReason('');
+      const d2 = await api(`/api/dashboard/credits/${selectedGuild}`);
+      setCredits(d2.credits || []);
+    } catch (e: any) { show(e.message, 'err'); }
+    setActing(null);
+  }
+
+  async function sendDm() {
+    if (!dmUserId || !dmMessage) return;
+    setActing('dm');
+    try {
+      await api('/api/dashboard/dm', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ userId: dmUserId, message: dmMessage }) });
+      show('✓ DM sent'); setDmUserId(''); setDmMessage('');
+    } catch (e: any) { show(e.message, 'err'); }
+    setActing(null);
+  }
+
+  return (
+    <>
+      {toast && <Toast {...toast} />}
+      <div className="space-y-8">
+
+        {/* Server selector */}
+        {servers.length > 1 && (
+          <div>
+            <label className="text-violet-400/50 text-xs uppercase tracking-wider block mb-2">Server</label>
+            <select value={selectedGuild} onChange={e => setSelectedGuild(e.target.value)}
+              className="bg-[#130E26] border border-[#2A1B50] rounded-xl px-4 py-2 text-sm text-violet-200 focus:outline-none focus:border-violet-600">
+              {servers.map(s => <option key={s.guildId} value={s.guildId}>{s.name}</option>)}
+            </select>
+          </div>
+        )}
+
+        {/* Export */}
+        <div>
+          <SectionHeader>Export Orders</SectionHeader>
+          <Card className="p-5">
+            <p className="text-violet-400/60 text-sm mb-4">Download order data as a CSV file.</p>
+            <div className="flex flex-wrap gap-3">
+              <a href={`/api/dashboard/export.csv${selectedGuild ? `?guildId=${selectedGuild}` : ''}`} download
+                className="text-xs border border-violet-600/40 bg-violet-600/10 text-violet-300 hover:bg-violet-600/20 px-3 py-1.5 rounded-lg transition-all">
+                ↓ Export {servers.find(s => s.guildId === selectedGuild)?.name || 'All'} Orders
+              </a>
+              <a href="/api/dashboard/export.csv" download
+                className="text-xs border border-[#2A1B50] text-violet-400/60 hover:border-violet-600 hover:text-violet-300 px-3 py-1.5 rounded-lg transition-all">
+                ↓ Export All Servers
+              </a>
+            </div>
+          </Card>
+        </div>
+
+        {/* DM a customer */}
+        <div>
+          <SectionHeader>Send DM to Customer</SectionHeader>
+          <Card className="p-5 space-y-3">
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+              <div>
+                <label className="text-violet-400/50 text-xs block mb-1">Discord User ID</label>
+                <input type="text" placeholder="e.g. 123456789012345678" value={dmUserId} onChange={e => setDmUserId(e.target.value)}
+                  className="w-full bg-[#0D0A1A] border border-[#2A1B50] rounded-lg px-3 py-2 text-sm text-violet-200 placeholder-violet-400/30 focus:outline-none focus:border-violet-600" />
+              </div>
+              <div>
+                <label className="text-violet-400/50 text-xs block mb-1">Message</label>
+                <input type="text" placeholder="Your message…" value={dmMessage} onChange={e => setDmMessage(e.target.value)}
+                  className="w-full bg-[#0D0A1A] border border-[#2A1B50] rounded-lg px-3 py-2 text-sm text-violet-200 placeholder-violet-400/30 focus:outline-none focus:border-violet-600" />
+              </div>
+            </div>
+            <Btn variant="primary" onClick={sendDm} disabled={!dmUserId || !dmMessage || acting === 'dm'}>
+              {acting === 'dm' ? '…' : '✉ Send DM'}
+            </Btn>
+          </Card>
+        </div>
+
+        {/* Credit management */}
+        <div>
+          <SectionHeader>Store Credits</SectionHeader>
+          <Card className="p-5 space-y-4">
+            <div>
+              <p className="text-violet-400/50 text-xs uppercase tracking-wider mb-3">Adjust Credit</p>
+              <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                <div>
+                  <label className="text-violet-400/50 text-xs block mb-1">User ID</label>
+                  <input type="text" placeholder="Discord User ID" value={creditUserId} onChange={e => setCreditUserId(e.target.value)}
+                    className="w-full bg-[#0D0A1A] border border-[#2A1B50] rounded-lg px-3 py-2 text-sm text-violet-200 placeholder-violet-400/30 focus:outline-none focus:border-violet-600" />
+                </div>
+                <div>
+                  <label className="text-violet-400/50 text-xs block mb-1">Amount (use − to subtract)</label>
+                  <input type="number" step="0.01" placeholder="e.g. 5.00 or -2.00" value={creditAmount} onChange={e => setCreditAmount(e.target.value)}
+                    className="w-full bg-[#0D0A1A] border border-[#2A1B50] rounded-lg px-3 py-2 text-sm text-violet-200 placeholder-violet-400/30 focus:outline-none focus:border-violet-600" />
+                </div>
+                <div>
+                  <label className="text-violet-400/50 text-xs block mb-1">Reason (optional)</label>
+                  <input type="text" placeholder="e.g. Refund" value={creditReason} onChange={e => setCreditReason(e.target.value)}
+                    className="w-full bg-[#0D0A1A] border border-[#2A1B50] rounded-lg px-3 py-2 text-sm text-violet-200 placeholder-violet-400/30 focus:outline-none focus:border-violet-600" />
+                </div>
+              </div>
+              <Btn className="mt-3" variant="primary" onClick={adjustCredit} disabled={!creditUserId || !creditAmount || acting === 'credit'}>
+                {acting === 'credit' ? '…' : 'Apply Credit'}
+              </Btn>
+            </div>
+
+            {loadingCR ? <div className="text-violet-400/40 text-sm text-center py-4">Loading…</div>
+              : credits.length > 0 ? (
+                <div>
+                  <p className="text-violet-400/50 text-xs uppercase tracking-wider mb-2">Current Balances</p>
+                  <div className="space-y-2">
+                    {credits.map(c => (
+                      <div key={c.userId} className="flex items-center gap-3 py-2 border-t border-[#2A1B50]/40">
+                        <span className="font-mono text-violet-400/60 text-xs flex-1 truncate">{c.userId}</span>
+                        {c.lastReason && <span className="text-violet-400/40 text-xs hidden sm:block truncate max-w-[150px]">{c.lastReason}</span>}
+                        <span className="text-emerald-400 font-medium tabular-nums text-sm">{fmtMoney(c.balance)}</span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              ) : <p className="text-violet-400/40 text-sm text-center py-2">No customers with credit balance.</p>
+            }
+          </Card>
+        </div>
+
+        {/* Blacklist */}
+        <div>
+          <SectionHeader>Blacklist</SectionHeader>
+          <Card className="overflow-hidden">
+            {loadingBL ? <EmptyState icon="⏳" text="Loading…" />
+              : !blacklist.length ? <EmptyState icon="✅" text="No blocked users." />
+              : (
+                <div className="divide-y divide-[#2A1B50]/60">
+                  {blacklist.map(entry => (
+                    <div key={entry.userId} className="px-5 py-3 flex items-center gap-3">
+                      <div className="flex-1 min-w-0">
+                        <span className="font-mono text-violet-300/70 text-xs">{entry.userId}</span>
+                        {entry.blockedAt && <p className="text-violet-400/40 text-xs mt-0.5">Blocked {timeAgo(entry.blockedAt)}</p>}
+                        {entry.reason && <p className="text-violet-400/50 text-xs mt-0.5">{entry.reason}</p>}
+                      </div>
+                      <Btn variant="success" size="xs" onClick={() => unblacklist(entry.userId)} disabled={acting === `bl:${entry.userId}`}>
+                        {acting === `bl:${entry.userId}` ? '…' : '✓ Unblock'}
+                      </Btn>
+                    </div>
+                  ))}
+                </div>
+              )
+            }
+          </Card>
+        </div>
+      </div>
+    </>
+  );
+}
+
+// ─── Main App ─────────────────────────────────────────────────────────────────
+
+type Tab = 'overview' | 'orders' | 'analytics' | 'servers' | 'tools' | 'commands' | 'settings' | 'terminal';
+const TABS: { id: Tab; label: string; icon: string }[] = [
+  { id: 'overview',  label: 'Overview',  icon: '📊' },
+  { id: 'orders',    label: 'Orders',    icon: '🛒' },
+  { id: 'analytics', label: 'Analytics', icon: '📈' },
+  { id: 'servers',   label: 'Servers',   icon: '🌐' },
+  { id: 'tools',     label: 'Tools',     icon: '🔧' },
+  { id: 'commands',  label: 'Commands',  icon: '⚡' },
+  { id: 'settings',  label: 'Settings',  icon: '⚙️' },
+  { id: 'terminal',  label: 'Terminal',  icon: '⬛' },
+];
+
+// ─── Terminal Panel ───────────────────────────────────────────────────────────
+
+function TerminalPanel() {
+  const containerRef = useRef<HTMLDivElement>(null);
+  const termRef = useRef<any>(null);
+  const fitRef = useRef<any>(null);
+  const wsRef = useRef<WebSocket | null>(null);
+
+  useEffect(() => {
+    let term: any;
+    let fitAddon: any;
+    let ws: WebSocket;
+
+    async function init() {
+      const { Terminal } = await import('@xterm/xterm');
+      const { FitAddon } = await import('@xterm/addon-fit');
+      const { WebLinksAddon } = await import('@xterm/addon-web-links');
+
+      term = new Terminal({
+        theme: {
+          background: '#0A0717',
+          foreground: '#d4c8f0',
+          cursor: '#a78bfa',
+          selectionBackground: '#3b2f6a',
+          black: '#1a1035',
+          red: '#f87171',
+          green: '#4ade80',
+          yellow: '#fbbf24',
+          blue: '#818cf8',
+          magenta: '#c084fc',
+          cyan: '#22d3ee',
+          white: '#e2e8f0',
+          brightBlack: '#4c3a7a',
+          brightRed: '#fca5a5',
+          brightGreen: '#86efac',
+          brightYellow: '#fde68a',
+          brightBlue: '#a5b4fc',
+          brightMagenta: '#d8b4fe',
+          brightCyan: '#67e8f9',
+          brightWhite: '#f8fafc',
+        },
+        fontFamily: '"JetBrains Mono", "Cascadia Code", "Fira Code", monospace',
+        fontSize: 13,
+        lineHeight: 1.4,
+        cursorBlink: true,
+        cursorStyle: 'bar',
+        scrollback: 5000,
+        allowTransparency: true,
+      });
+
+      fitAddon = new FitAddon();
+      term.loadAddon(fitAddon);
+      term.loadAddon(new WebLinksAddon());
+
+      if (containerRef.current) {
+        term.open(containerRef.current);
+        fitAddon.fit();
+      }
+
+      termRef.current = term;
+      fitRef.current = fitAddon;
+
+      const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+      ws = new WebSocket(`${proto}//${window.location.host}/terminal`);
+      wsRef.current = ws;
+
+      ws.onopen = () => {
+        ws.send(JSON.stringify({ type: 'resize', cols: term.cols, rows: term.rows }));
+      };
+      ws.onmessage = (e) => {
+        try {
+          const msg = JSON.parse(e.data);
+          if (msg.type === 'output') term.write(msg.data);
+        } catch { /* ignore */ }
+      };
+      ws.onclose = () => term.writeln('\r\n\x1b[31m[connection closed]\x1b[0m');
+
+      term.onData((data: string) => {
+        if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'input', data }));
+      });
+    }
+
+    init().catch(console.error);
+
+    const handleResize = () => { fitRef.current?.fit(); };
+    window.addEventListener('resize', handleResize);
+
+    return () => {
+      window.removeEventListener('resize', handleResize);
+      wsRef.current?.close();
+      termRef.current?.dispose();
+    };
+  }, []);
+
+  // Relay fit to xterm when panel becomes visible
+  useEffect(() => {
+    setTimeout(() => fitRef.current?.fit(), 50);
+  });
+
+  return (
+    <div className="flex flex-col h-[calc(100vh-160px)]">
+      <div className="flex items-center justify-between mb-4">
+        <h2 className="text-white font-semibold text-lg">Terminal</h2>
+        <button
+          onClick={() => {
+            if (wsRef.current?.readyState === WebSocket.OPEN) {
+              wsRef.current.send(JSON.stringify({ type: 'input', data: '\x0c' })); // Ctrl+L clear
+            }
+          }}
+          className="text-xs text-violet-400/60 hover:text-violet-300 border border-[#2A1B50] rounded-lg px-3 py-1.5 transition-colors"
+        >
+          Clear
+        </button>
+      </div>
+      <div
+        ref={containerRef}
+        className="flex-1 rounded-xl overflow-hidden border border-[#2A1B50]"
+        style={{ padding: '12px', background: '#0A0717' }}
+      />
+    </div>
+  );
+}
+
+// ─── Settings Panel ───────────────────────────────────────────────────────────
+
+function SettingsPanel() {
+  const { toast, show } = useToast();
+  const [cookie, setCookie] = useState('');
+  const [webhookUrl, setWebhookUrl] = useState('');
+  const [preview, setPreview] = useState<{ cashappCookieSet: boolean; cashappCookiePreview: string; webhookUrl: string; discordToken: string } | null>(null);
+  const [saving, setSaving] = useState<string | null>(null);
+
+  useEffect(() => {
+    api('/api/settings').then(d => {
+      setPreview(d);
+      setWebhookUrl(d.webhookUrl || '');
+    }).catch(() => {});
+  }, []);
+
+  async function saveCookie() {
+    if (!cookie.trim()) return show('Paste your cash_web_session cookie first', 'err');
+    setSaving('cookie');
+    try {
+      await api('/api/settings', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ cashappCookie: cookie.trim() }) });
+      show('✓ Cash App cookie saved');
+      setCookie('');
+      const d = await api('/api/settings');
+      setPreview(d);
+    } catch (e: any) { show(e.message, 'err'); }
+    setSaving(null);
+  }
+
+  async function saveWebhook() {
+    setSaving('webhook');
+    try {
+      await api('/api/settings', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ webhookUrl: webhookUrl.trim() }) });
+      show('✓ Webhook URL saved');
+      const d = await api('/api/settings');
+      setPreview(d);
+    } catch (e: any) { show(e.message, 'err'); }
+    setSaving(null);
+  }
+
+  return (
+    <>
+      {toast && <Toast {...toast} />}
+      <div className="space-y-8">
+
+        {/* Cash App Cookie */}
+        <div>
+          <SectionHeader>Cash App Session Cookie</SectionHeader>
+          <Card className="p-5 space-y-4">
+            <p className="text-violet-400/60 text-sm">
+              Used to auto-verify incoming Cash App payments. Expires when you log out of cash.app on the web.
+            </p>
+            {preview && (
+              <div className={`flex items-center gap-2 text-xs px-3 py-2 rounded-lg border ${preview.cashappCookieSet ? 'border-emerald-600/30 bg-emerald-600/10 text-emerald-400' : 'border-amber-600/30 bg-amber-600/10 text-amber-400'}`}>
+                <span>{preview.cashappCookieSet ? '✓ Cookie set' : '⚠ No cookie set — manual verification only'}</span>
+                {preview.cashappCookieSet && <span className="font-mono opacity-60 ml-2">{preview.cashappCookiePreview}</span>}
+              </div>
+            )}
+            <div>
+              <label className="text-violet-400/50 text-xs block mb-1">New Cookie Value</label>
+              <p className="text-violet-400/40 text-xs mb-2">
+                Go to cash.app → DevTools → Application → Cookies → copy <code className="bg-[#1E1540] px-1 rounded">cash_web_session</code>
+              </p>
+              <textarea
+                rows={3}
+                placeholder="eyJ1c2VyX3Nlc3Npb25..."
+                value={cookie}
+                onChange={e => setCookie(e.target.value)}
+                className="w-full bg-[#0D0A1A] border border-[#2A1B50] rounded-lg px-3 py-2 text-xs text-violet-200 placeholder-violet-400/30 focus:outline-none focus:border-violet-600 font-mono resize-none"
+              />
+            </div>
+            <Btn variant="primary" onClick={saveCookie} disabled={saving === 'cookie'}>{saving === 'cookie' ? 'Saving…' : 'Save Cookie'}</Btn>
+          </Card>
+        </div>
+
+        {/* Global Webhook */}
+        <div>
+          <SectionHeader>Default Discord Webhook</SectionHeader>
+          <Card className="p-5 space-y-4">
+            <p className="text-violet-400/60 text-sm">
+              Global fallback webhook for order notifications and admin alerts. Per-server webhooks (set via <code className="bg-[#1E1540] px-1 rounded text-xs">/admin_setup</code>) override this.
+            </p>
+            <div>
+              <label className="text-violet-400/50 text-xs block mb-1">Webhook URL</label>
+              <input
+                type="text"
+                placeholder="https://discord.com/api/webhooks/..."
+                value={webhookUrl}
+                onChange={e => setWebhookUrl(e.target.value)}
+                className="w-full bg-[#0D0A1A] border border-[#2A1B50] rounded-lg px-3 py-2 text-sm text-violet-200 placeholder-violet-400/30 focus:outline-none focus:border-violet-600"
+              />
+            </div>
+            <Btn variant="primary" onClick={saveWebhook} disabled={saving === 'webhook'}>{saving === 'webhook' ? 'Saving…' : 'Save Webhook'}</Btn>
+          </Card>
+        </div>
+
+        {/* Bot Token (read-only reminder) */}
+        <div>
+          <SectionHeader>Discord Bot Token</SectionHeader>
+          <Card className="p-5 space-y-3">
+            <p className="text-violet-400/60 text-sm">
+              Token is set in your <code className="bg-[#1E1540] px-1 rounded text-xs">.env</code> file. To change it, edit <code className="bg-[#1E1540] px-1 rounded text-xs">DISCORD_TOKEN</code> and restart the app.
+            </p>
+            {preview && (
+              <div className="flex items-center gap-2 text-xs px-3 py-2 rounded-lg border border-[#2A1B50] bg-[#0D0A1A] text-violet-400/60 font-mono">
+                {preview.discordToken || '(not set)'}
+              </div>
+            )}
+          </Card>
+        </div>
+
+      </div>
+    </>
+  );
+}
+
+// ─── Commands Panel ───────────────────────────────────────────────────────────
+
+function CommandsPanel() {
+  const { toast, show } = useToast();
+  const [guilds, setGuilds] = useState<{ id: string; name: string; memberCount: number }[]>([]);
+  const [selectedGuild, setSelectedGuild] = useState('');
+  const [acting, setActing] = useState<string | null>(null);
+
+  // Announcement
+  const [announceMsg, setAnnounceMsg] = useState('');
+  const [announceTarget, setAnnounceTarget] = useState('all');
+
+  // Batch
+  const [batchOrders, setBatchOrders] = useState<any[]>([]);
+  const [batchLoaded, setBatchLoaded] = useState(false);
+
+  // Round summary
+  const [roundSummary, setRoundSummary] = useState<{ total: number; paid: number; pending: number; revenue: number } | null>(null);
+
+  useEffect(() => {
+    api('/api/dashboard/guilds').then(d => {
+      setGuilds(d.guilds || []);
+      if (d.guilds?.length) setSelectedGuild(d.guilds[0].id);
+    }).catch(() => {});
+  }, []);
+
+  async function sendAnnouncement() {
+    if (!announceMsg.trim()) return show('Enter a message first', 'err');
+    setActing('announce');
+    try {
+      const body: any = { message: announceMsg };
+      if (announceTarget !== 'all') body.guildId = announceTarget;
+      const d = await api('/api/dashboard/announce', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+      show(`✓ Sent to ${d.sent} server(s)`);
+      setAnnounceMsg('');
+    } catch (e: any) { show(e.message, 'err'); }
+    setActing(null);
+  }
+
+  async function loadBatch() {
+    if (!selectedGuild) return;
+    setActing('loadbatch');
+    try {
+      const d = await api(`/api/dashboard/batch/${selectedGuild}`);
+      setBatchOrders(d.orders || []);
+      setBatchLoaded(true);
+    } catch (e: any) { show(e.message, 'err'); }
+    setActing(null);
+  }
+
+  async function clearBatch() {
+    if (!selectedGuild) return;
+    setActing('clearbatch');
+    try {
+      const d = await api(`/api/dashboard/batch/${selectedGuild}/clear`, { method: 'POST' });
+      show(`✓ Cleared ${d.cleared} order(s) from batch`);
+      setBatchOrders([]);
+      setBatchLoaded(false);
+    } catch (e: any) { show(e.message, 'err'); }
+    setActing(null);
+  }
+
+  async function loadRoundSummary() {
+    if (!selectedGuild) return;
+    setActing('roundsummary');
+    try {
+      const d = await api(`/api/dashboard/roundsummary/${selectedGuild}`);
+      setRoundSummary(d);
+    } catch (e: any) { show(e.message, 'err'); }
+    setActing(null);
+  }
+
+  async function fulfillAll() {
+    if (!selectedGuild) return;
+    setActing('fulfillall');
+    try {
+      const d = await api(`/api/dashboard/servers/${selectedGuild}/fulfillall`, { method: 'POST' });
+      show(`✓ Fulfilled ${d.count} order(s)`);
+    } catch (e: any) { show(e.message, 'err'); }
+    setActing(null);
+  }
+
+  const INPUT = "w-full bg-[#0D0A1A] border border-[#2A1B50] rounded-lg px-3 py-2 text-sm text-violet-200 placeholder-violet-400/30 focus:outline-none focus:border-violet-600";
+  const SELECT = "bg-[#130E26] border border-[#2A1B50] rounded-xl px-3 py-2 text-sm text-violet-200 focus:outline-none focus:border-violet-600 w-full";
+
+  return (
+    <>
+      {toast && <Toast {...toast} />}
+      <div className="space-y-8">
+
+        {/* Server selector */}
+        {guilds.length > 1 && (
+          <div>
+            <label className="text-violet-400/50 text-xs uppercase tracking-wider block mb-2">Target Server</label>
+            <select value={selectedGuild} onChange={e => setSelectedGuild(e.target.value)} className={SELECT}>
+              {guilds.map(g => <option key={g.id} value={g.id}>{g.name} ({g.memberCount} members)</option>)}
+            </select>
+          </div>
+        )}
+
+        {/* Announcements */}
+        <div>
+          <SectionHeader>📢 Broadcast Announcement</SectionHeader>
+          <Card className="p-5 space-y-3">
+            <p className="text-violet-400/60 text-sm">Send a message to one or all server webhook channels.</p>
+            <div>
+              <label className="text-violet-400/50 text-xs block mb-1">Target</label>
+              <select value={announceTarget} onChange={e => setAnnounceTarget(e.target.value)} className={SELECT}>
+                <option value="all">All Servers</option>
+                {guilds.map(g => <option key={g.id} value={g.id}>{g.name}</option>)}
+              </select>
+            </div>
+            <div>
+              <label className="text-violet-400/50 text-xs block mb-1">Message</label>
+              <textarea rows={3} placeholder="@everyone Orders are open! Use /order to place your order." value={announceMsg} onChange={e => setAnnounceMsg(e.target.value)} className={`${INPUT} resize-none`} />
+            </div>
+            <Btn variant="primary" onClick={sendAnnouncement} disabled={acting === 'announce'}>{acting === 'announce' ? 'Sending…' : '📢 Send Announcement'}</Btn>
+          </Card>
+        </div>
+
+        {/* Fulfill All */}
+        <div>
+          <SectionHeader>✅ Fulfill All Paid Orders</SectionHeader>
+          <Card className="p-5 space-y-3">
+            <p className="text-violet-400/60 text-sm">Mark all paid-but-unfulfilled orders as fulfilled and notify customers. Equivalent to <code className="bg-[#1E1540] px-1 rounded text-xs">/fulfillall</code>.</p>
+            <Btn variant="success" onClick={fulfillAll} disabled={acting === 'fulfillall' || !selectedGuild}>{acting === 'fulfillall' ? 'Fulfilling…' : '✅ Fulfill All'}</Btn>
+          </Card>
+        </div>
+
+        {/* Round Summary */}
+        <div>
+          <SectionHeader>📋 Today's Round Summary</SectionHeader>
+          <Card className="p-5 space-y-3">
+            <p className="text-violet-400/60 text-sm">Summary of all orders placed today for the selected server.</p>
+            <Btn onClick={loadRoundSummary} disabled={acting === 'roundsummary' || !selectedGuild}>{acting === 'roundsummary' ? 'Loading…' : '📋 Load Summary'}</Btn>
+            {roundSummary && (
+              <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 mt-2">
+                <StatCard label="Total Orders" value={String(roundSummary.total)} />
+                <StatCard label="Paid" value={String(roundSummary.paid)} accent="text-emerald-400" />
+                <StatCard label="Pending" value={String(roundSummary.pending)} accent={roundSummary.pending > 0 ? 'text-amber-400' : undefined} />
+                <StatCard label="Revenue" value={fmtMoney(roundSummary.revenue)} accent="text-emerald-400" />
+              </div>
+            )}
+          </Card>
+        </div>
+
+        {/* Batch Management */}
+        <div>
+          <SectionHeader>🗂 Batch Management</SectionHeader>
+          <Card className="p-5 space-y-3">
+            <p className="text-violet-400/60 text-sm">View and clear the current order batch. Equivalent to <code className="bg-[#1E1540] px-1 rounded text-xs">/admin_batch</code>.</p>
+            <div className="flex gap-2 flex-wrap">
+              <Btn onClick={loadBatch} disabled={acting === 'loadbatch' || !selectedGuild}>{acting === 'loadbatch' ? 'Loading…' : '🗂 View Batch'}</Btn>
+              {batchLoaded && batchOrders.length > 0 && (
+                <Btn variant="danger" onClick={clearBatch} disabled={acting === 'clearbatch'}>{acting === 'clearbatch' ? 'Clearing…' : '🗑 Clear Batch'}</Btn>
+              )}
+            </div>
+            {batchLoaded && (
+              batchOrders.length === 0
+                ? <p className="text-violet-400/40 text-sm">No orders in current batch.</p>
+                : (
+                  <div className="divide-y divide-[#2A1B50]/40">
+                    {batchOrders.map((o: any) => (
+                      <div key={o.id} className="py-2 flex items-center gap-3">
+                        <code className="text-violet-400/60 text-xs font-mono">{o.id}</code>
+                        <span className="text-violet-200/80 text-sm flex-1 truncate">{o.items || '—'}</span>
+                        <StatusBadge status={o.status} />
+                        <span className="text-emerald-400 text-sm tabular-nums">{fmtMoney(o.total || 0)}</span>
+                      </div>
+                    ))}
+                  </div>
+                )
+            )}
+          </Card>
+        </div>
+
+        {/* All Discord Commands Reference */}
+        <div>
+          <SectionHeader>📖 Discord Commands Reference</SectionHeader>
+          <Card className="overflow-hidden">
+            <div className="divide-y divide-[#2A1B50]/40">
+              {[
+                { cmd: '/order', desc: 'Start a new Chipotle order', who: 'Customer' },
+                { cmd: '/reorder', desc: 'Repeat your last order instantly', who: 'Customer' },
+                { cmd: '/myorders', desc: 'Check your recent order statuses', who: 'Customer' },
+                { cmd: '/menu', desc: 'View the full Chipotle menu', who: 'Customer' },
+                { cmd: '/schedule', desc: 'View queue times and pickup rules', who: 'Customer' },
+                { cmd: '/wallet', desc: 'Check your credit balance', who: 'Customer' },
+                { cmd: '/hours', desc: "View today's queue schedule", who: 'Customer' },
+                { cmd: '/support', desc: 'Get help with an order issue', who: 'Customer' },
+                { cmd: '/config', desc: 'Configure bot messages and embeds', who: 'Admin' },
+                { cmd: '/cashapp', desc: 'Set your Cash App $cashtag', who: 'Admin' },
+                { cmd: '/setpayment', desc: 'Update Venmo, Zelle, Crypto handles', who: 'Admin' },
+                { cmd: '/admin_setup', desc: 'Configure Stripe, webhooks, pricing', who: 'Admin' },
+                { cmd: '/admin_orders', desc: 'View and confirm pending orders', who: 'Admin' },
+                { cmd: '/admin_batch', desc: 'View and clear the current batch', who: 'Admin' },
+                { cmd: '/pending', desc: 'Quick view of pending orders', who: 'Admin' },
+                { cmd: '/storestatus', desc: 'Open or close the store', who: 'Admin' },
+                { cmd: '/pause', desc: 'Pause or resume ordering rounds', who: 'Admin' },
+                { cmd: '/fulfillall', desc: 'Fulfill all paid orders at once', who: 'Admin' },
+                { cmd: '/credit', desc: 'Add or deduct customer credit', who: 'Admin' },
+                { cmd: '/blacklist', desc: 'Block a user from ordering', who: 'Admin' },
+                { cmd: '/announcements', desc: 'Broadcast message to all servers', who: 'Admin' },
+                { cmd: '/dm', desc: 'Send a DM to a specific customer', who: 'Admin' },
+                { cmd: '/revenue', desc: 'View revenue stats', who: 'Admin' },
+                { cmd: '/stats', desc: 'View server order statistics', who: 'Admin' },
+                { cmd: '/export', desc: 'Export orders as a file', who: 'Admin' },
+                { cmd: '/roundsummary', desc: "Summary of today's rounds", who: 'Admin' },
+                { cmd: '/format', desc: 'Customize order output format', who: 'Admin' },
+                { cmd: '/branding', desc: 'Update bot display name and colors', who: 'Admin' },
+                { cmd: '/renamechannel', desc: 'Rename a server channel', who: 'Admin' },
+              ].map(r => (
+                <div key={r.cmd} className="px-5 py-2.5 flex items-center gap-3">
+                  <code className="text-violet-300 text-xs font-mono w-36 shrink-0">{r.cmd}</code>
+                  <span className="text-violet-400/60 text-xs flex-1">{r.desc}</span>
+                  <span className={`text-xs px-2 py-0.5 rounded-full border ${r.who === 'Admin' ? 'border-amber-600/30 text-amber-400/80 bg-amber-600/10' : 'border-violet-600/20 text-violet-400/60'}`}>{r.who}</span>
+                </div>
+              ))}
+            </div>
+          </Card>
+        </div>
+
+      </div>
+    </>
+  );
+}
+
+export default function App() {
+  const [data, setData] = useState<DashboardData | null>(null);
+  const [error, setError] = useState(false);
+  const [lastRefresh, setLastRefresh] = useState<Date>(new Date());
+  const [countdown, setCountdown] = useState(30);
+  const [tab, setTab] = useState<Tab>('overview');
+  const [orderTab, setOrderTab] = useState<'pending' | 'all'>('pending');
+
+  const load = useCallback(async () => {
+    try {
+      const res = await fetch('/api/dashboard');
+      if (res.ok) { setData(await res.json()); setError(false); }
+      else setError(true);
+    } catch { setError(true); }
+    setLastRefresh(new Date());
+    setCountdown(30);
+  }, []);
+
+  useEffect(() => { load(); const i = setInterval(load, 30_000); return () => clearInterval(i); }, [load]);
+  useEffect(() => { const t = setInterval(() => setCountdown(c => Math.max(0, c - 1)), 1000); return () => clearInterval(t); }, [lastRefresh]);
+
+  const fulfilmentRate = data && data.today.orders > 0 ? Math.round((data.today.fulfilledCount / data.today.orders) * 100) : null;
+
+  return (
+    <div className="min-h-screen bg-[#0D0A1A] text-white font-sans">
+      {/* Header */}
+      <header className="border-b border-[#2A1B50]/60 px-6 py-4 flex items-center justify-between sticky top-0 bg-[#0D0A1A]/95 backdrop-blur z-20">
+        <div className="flex items-center gap-3">
+          <img src="/logo.png" alt="Burrito.exe" className="w-8 h-8 rounded-lg shadow shadow-violet-600/30" />
+          <span className="font-semibold text-sm text-white">Burrito Bot</span>
+          {data?.bot.online && (
+            <span className="flex items-center gap-1 text-xs text-emerald-400">
+              <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
+              {data.bot.tag}
+            </span>
+          )}
+        </div>
+        <div className="flex items-center gap-3">
+          <span className="text-violet-400/40 text-xs hidden sm:block">↻ in {countdown}s</span>
+          <Btn onClick={load}>Refresh</Btn>
+          {error && <span className="text-red-400 text-xs border border-red-500/20 bg-red-500/10 px-2.5 py-1 rounded-lg">API error</span>}
+        </div>
+      </header>
+
+      {/* Tabs */}
+      <div className="border-b border-[#2A1B50]/40 px-4 sm:px-6 flex gap-1 overflow-x-auto">
+        {TABS.map(t => (
+          <button key={t.id} onClick={() => setTab(t.id)}
+            className={`flex items-center gap-1.5 px-4 py-3 text-sm whitespace-nowrap transition-all border-b-2 flex-shrink-0 ${tab === t.id ? 'border-violet-500 text-white font-medium' : 'border-transparent text-violet-400/50 hover:text-violet-300'}`}>
+            <span>{t.icon}</span><span>{t.label}</span>
+            {t.id === 'orders' && data && data.today.pendingCount > 0 && (
+              <span className="bg-amber-500 text-black text-xs font-bold rounded-full px-1.5 py-0.5 leading-none">{data.today.pendingCount}</span>
+            )}
+          </button>
+        ))}
+      </div>
+
+      <main className="max-w-5xl mx-auto px-4 sm:px-6 py-8 space-y-8">
+
+        {/* ── OVERVIEW ── */}
+        {tab === 'overview' && (
+          <>
+            <Card className="px-5 py-4 flex items-center gap-4">
+              <div className="w-12 h-12 bg-violet-600/10 border border-violet-600/20 rounded-xl flex items-center justify-center text-2xl">🤖</div>
+              <div className="flex-1 min-w-0">
+                <div className="flex items-center gap-2 flex-wrap">
+                  <span className="font-semibold text-white">{data?.bot.username || '—'}</span>
+                  {data?.bot.tag && <span className="text-violet-400/60 text-sm">{data.bot.tag}</span>}
+                </div>
+                <div className="flex items-center gap-4 mt-1">
+                  <div className="flex items-center gap-1.5">
+                    <div className={`w-2 h-2 rounded-full ${data?.bot.online ? 'bg-emerald-500 animate-pulse' : 'bg-red-500'}`} />
+                    <span className={`text-xs font-medium ${data?.bot.online ? 'text-emerald-400' : 'text-red-400'}`}>{data?.bot.online ? 'Online' : 'Offline'}</span>
+                  </div>
+                  {data && <span className="text-violet-400/50 text-xs">{data.bot.guildCount} server{data.bot.guildCount !== 1 ? 's' : ''}</span>}
+                </div>
+              </div>
+            </Card>
+
+            <div>
+              <SectionHeader>Today</SectionHeader>
+              <div className="grid grid-cols-2 sm:grid-cols-3 gap-3">
+                <StatCard label="Orders"    value={data ? String(data.today.orders) : '—'}               sub="placed today" />
+                <StatCard label="Revenue"   value={data ? fmtMoney(data.today.revenue) : '—'}            sub="collected today" />
+                <StatCard label="Entrees"   value={data ? String(data.today.entrees) : '—'}              sub={data && data.today.orders > 0 ? `avg ${(data.today.entrees / data.today.orders).toFixed(1)}/order` : 'avg —'} />
+                <StatCard label="Avg Order" value={data ? fmtMoney(data.today.avgOrderValue) : '—'}      sub="per order" />
+                <StatCard label="Pending"   value={data ? String(data.today.pendingCount) : '—'}
+                  sub={data ? `${fmtMoney(data.today.pendingRevenue)} uncollected` : undefined}
+                  accent={data && data.today.pendingCount > 0 ? 'text-amber-400' : undefined} />
+                <StatCard label="Fulfilled" value={data ? `${data.today.fulfilledCount}${fulfilmentRate !== null ? ` (${fulfilmentRate}%)` : ''}` : '—'}
+                  sub="paid & sent" accent={data && data.today.fulfilledCount > 0 ? 'text-emerald-400' : undefined} />
+              </div>
+            </div>
+
+            {data && data.today.orders > 0 && (
+              <div>
+                <SectionHeader>Status Breakdown — Today</SectionHeader>
+                <Card className="p-5"><StatusBreakdown breakdown={data.today.statusBreakdown} /></Card>
+              </div>
+            )}
+
+            <div>
+              <SectionHeader>All Time</SectionHeader>
+              <div className="grid grid-cols-2 sm:grid-cols-3 gap-3">
+                <StatCard label="Total Orders"  value={data ? String(data.allTime.orders) : '—'}          sub="paid orders" />
+                <StatCard label="Total Revenue" value={data ? fmtMoney(data.allTime.revenue) : '—'}       sub="all servers" />
+                <StatCard label="Avg Order"     value={data ? fmtMoney(data.allTime.avgOrderValue) : '—'} sub="all time" />
+              </div>
+            </div>
+
+            <div>
+              <SectionHeader>Quick Reference</SectionHeader>
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                {[
+                  { cmd: '/order', desc: 'Start a new order', tag: 'customer' },
+                  { cmd: '/reorder', desc: 'Repeat last order', tag: 'customer' },
+                  { cmd: '/hours', desc: 'View queue round status', tag: 'customer' },
+                  { cmd: '/manualorder', desc: 'Create order without payment', tag: 'customer' },
+                  { cmd: '/storestatus', desc: 'Open or close the store', tag: 'admin' },
+                  { cmd: '/pause', desc: 'Pause / resume a round', tag: 'admin' },
+                  { cmd: '/roundsummary', desc: 'Round breakdown', tag: 'admin' },
+                  { cmd: '/stats', desc: "Today's snapshot", tag: 'admin' },
+                  { cmd: '/credit', desc: 'Adjust store credit', tag: 'admin' },
+                  { cmd: '/export', desc: 'Export all orders to CSV', tag: 'admin' },
+                  { cmd: '/fulfillall', desc: 'Mark all paid as fulfilled', tag: 'admin' },
+                  { cmd: '/dm', desc: 'DM a customer', tag: 'admin' },
+                ].map(({ cmd, desc, tag }) => (
+                  <div key={cmd} className="flex items-center gap-3 bg-[#130E26] border border-[#2A1B50] rounded-xl px-4 py-3">
+                    <code className="text-violet-400 font-mono text-xs bg-[#1E1540] px-2 py-1 rounded flex-shrink-0">{cmd}</code>
+                    <span className="text-violet-200/70 text-sm flex-1 min-w-0 truncate">{desc}</span>
+                    <span className={`text-xs px-1.5 py-0.5 rounded flex-shrink-0 ${tag === 'admin' ? 'bg-violet-600/10 text-violet-400' : 'bg-[#1E1540] text-violet-400/50'}`}>{tag}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          </>
+        )}
+
+        {/* ── ORDERS ── */}
+        {tab === 'orders' && (
+          <>
+            <div className="flex gap-2">
+              {(['pending', 'all'] as const).map(t => (
+                <button key={t} onClick={() => setOrderTab(t)}
+                  className={`text-sm px-4 py-2 rounded-xl border transition-all ${orderTab === t ? 'bg-violet-600 border-violet-600 text-white' : 'bg-[#130E26] border-[#2A1B50] text-violet-400/60 hover:border-violet-600/50'}`}>
+                  {t === 'pending' ? `⏳ Pending${data && data.today.pendingCount > 0 ? ` (${data.today.pendingCount})` : ''}` : '📋 All Recent'}
+                </button>
+              ))}
+            </div>
+            {orderTab === 'pending' ? <PendingPanel onAction={load} /> : <AllOrdersPanel orders={data?.recentOrders || []} />}
+          </>
+        )}
+
+        {/* ── ANALYTICS ── */}
+        {tab === 'analytics' && (
+          <AnalyticsPanel topItems={data?.topItems || []} topProteins={data?.topProteins || []} statusBreakdown={data?.today.statusBreakdown || {}} />
+        )}
+
+        {/* ── SERVERS ── */}
+        {tab === 'servers' && (
+          <>
+            <SectionHeader>Server Management</SectionHeader>
+            <ServersPanel />
+          </>
+        )}
+
+        {/* ── TOOLS ── */}
+        {tab === 'tools' && <ToolsPanel />}
+
+        {/* ── COMMANDS ── */}
+        {tab === 'commands' && <CommandsPanel />}
+
+        {/* ── SETTINGS ── */}
+        {tab === 'settings' && <SettingsPanel />}
+
+        {/* ── TERMINAL ── */}
+        {tab === 'terminal' && <TerminalPanel />}
+
+      </main>
+
+      <footer className="border-t border-[#2A1B50]/60 px-6 py-4 mt-8">
+        <p className="text-violet-400/30 text-xs text-center">
+          Burrito Bot Dashboard · Auto-refreshes every 30s · {lastRefresh.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })}
+        </p>
+      </footer>
+    </div>
+  );
+}

@@ -1,37 +1,143 @@
 {
-  "name": "react-example",
+  "name": "burrito-bot",
+  "productName": "Burrito Bot",
   "private": true,
-  "version": "0.0.0",
+  "version": "1.0.0",
   "type": "module",
+  "main": "electron-app/main.cjs",
   "scripts": {
     "dev": "tsx server.ts",
     "build": "vite build",
     "preview": "vite preview",
     "clean": "rm -rf dist",
-    "lint": "tsc --noEmit"
+    "lint": "tsc --noEmit",
+    "electron": "electron .",
+    "electron:build": "npm run build && electron-builder"
+  },
+  "build": {
+    "appId": "com.burritobot.app",
+    "electronVersion": "41.0.4",
+    "productName": "Burrito Bot",
+    "directories": {
+      "output": "electron-dist"
+    },
+    "mac": {
+      "target": [
+        {
+          "target": "dir",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "category": "public.app-category.utilities",
+      "darkModeSupport": true
+    },
+    "asar": false,
+    "files": [
+      "electron-app/**/*",
+      "!electron-app/electron-builder.json"
+    ],
+    "extraFiles": [
+      {
+        "from": "electron-app/bundle-package.json",
+        "to": "Resources/app/package.json"
+      }
+    ],
+    "extraResources": [
+      {
+        "from": ".",
+        "to": "project",
+        "filter": [
+          "server.ts",
+          "cashapp.ts",
+          "firebase.ts",
+          "firebase-applet-config.json",
+          "firebase-blueprint.json",
+          "firestore.rules",
+          "service-account.json",
+          ".env",
+          "tsconfig.json",
+          "vite.config.ts",
+          "index.html",
+          "package.json",
+          "package-lock.json",
+          "admin/**/*",
+          "src/**/*",
+          "dist/**/*"
+        ]
+      },
+      {
+        "from": "node_modules",
+        "to": "project/node_modules",
+        "filter": [
+          "**/*",
+          "!**/*.map",
+          "!**/*.ts",
+          "!**/test/**",
+          "!**/tests/**",
+          "!**/__tests__/**",
+          "!**/jest*/**",
+          "!**/mocha*/**",
+          "!electron/**",
+          "!electron-builder/**",
+          "!electron-publish/**",
+          "!app-builder-lib/**",
+          "!builder-util/**",
+          "!builder-util-runtime/**",
+          "!@electron/**",
+          "!vite/**",
+          "!@vitejs/**",
+          "!typescript/**",
+          "!tsx/**",
+          "!tailwindcss/**",
+          "!@tailwindcss/**",
+          "!autoprefixer/**",
+          "!postcss/**",
+          "!lightningcss*/**",
+          "!esbuild/**",
+          "!rollup/**",
+          "!@rollup/**",
+          "!@babel/**",
+          "!@types/**",
+          "!electron-download/**",
+          "!dmg-builder/**",
+          "!@develar/**"
+        ]
+      }
+    ]
   },
   "dependencies": {
     "@google/genai": "^1.29.0",
     "@tailwindcss/vite": "^4.1.14",
     "@vitejs/plugin-react": "^5.0.4",
+    "@xterm/addon-fit": "^0.11.0",
+    "@xterm/addon-web-links": "^0.12.0",
+    "@xterm/xterm": "^6.0.0",
     "clsx": "^2.1.1",
     "discord.js": "^14.25.1",
     "dotenv": "^17.2.3",
     "express": "^4.21.2",
     "firebase": "^12.11.0",
     "firebase-admin": "^13.7.0",
+    "imapflow": "^1.2.18",
     "lucide-react": "^0.546.0",
     "motion": "^12.23.24",
+    "node-pty": "^1.1.0",
+    "puppeteer-core": "^24.40.0",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
     "stripe": "^20.4.1",
     "tailwind-merge": "^3.5.0",
-    "vite": "^6.2.0"
+    "vite": "^6.2.0",
+    "ws": "^8.20.0"
   },
   "devDependencies": {
     "@types/express": "^4.17.21",
     "@types/node": "^22.14.0",
     "autoprefixer": "^10.4.21",
+    "electron": "^41.0.4",
+    "electron-builder": "^26.8.1",
     "tailwindcss": "^4.1.14",
     "tsx": "^4.21.0",
     "typescript": "~5.8.2",
