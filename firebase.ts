@@ -32,9 +32,8 @@ try {
   const serviceAccountPath = join(__dirname, 'service-account.json');
 
   if (process.env.SERVICE_ACCOUNT_JSON) {
-    // JSON string env var (for Railway / cloud deployments)
-    // Railway sometimes converts \n in private keys to literal newlines — re-escape them
-    const rawJson = process.env.SERVICE_ACCOUNT_JSON.replace(/\n/g, '\\n');
+    // Base64-encoded JSON (avoids newline corruption in Railway env vars)
+    const rawJson = Buffer.from(process.env.SERVICE_ACCOUNT_JSON, 'base64').toString('utf8');
     const serviceAccount = JSON.parse(rawJson);
     app = admin.initializeApp({
       credential: admin.credential.cert(serviceAccount),
