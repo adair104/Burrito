@@ -452,6 +452,11 @@ const commands = [
           { name: 'Round 4 — Placement 4:45 PM',  value: 4 },
         )
     ),
+  new SlashCommandBuilder()
+    .setName('lockdown')
+    .setDescription('Make a channel private — visible only to admins and a staff role (Admin only)')
+    .addRoleOption(option => option.setName('staff_role').setDescription('Role that should still see this channel').setRequired(true))
+    .addChannelOption(option => option.setName('channel').setDescription('Channel to lock (defaults to current channel)').setRequired(false)),
 ].map(command => command.toJSON());
 
 // Handle global errors to prevent silent crashes
@@ -889,7 +894,7 @@ async function initDiscordBot() {
             }
           }
 
-          const adminCommands = ['revenue', 'setprice', 'setpayment', 'branding', 'toggle', 'settings', 'blacklist', 'customers', 'setnickname', 'admin_setup', 'announcements', 'fulfillall', 'storestatus', 'renamechannel', 'export', 'pending', 'format', 'setwebhook', 'test', 'credit', 'pause', 'dm', 'stats', 'formatorderfoodie', 'roundsummary', 'exportround', 'manualorder'];
+          const adminCommands = ['revenue', 'setprice', 'setpayment', 'branding', 'toggle', 'settings', 'blacklist', 'customers', 'setnickname', 'admin_setup', 'announcements', 'fulfillall', 'storestatus', 'renamechannel', 'export', 'pending', 'format', 'setwebhook', 'test', 'credit', 'pause', 'dm', 'stats', 'formatorderfoodie', 'roundsummary', 'exportround', 'manualorder', 'lockdown'];
           const staffCommands = ['orders', 'history', 'forceconfirm', 'removeorder'];
 
           if (adminCommands.includes(interaction.commandName) || staffCommands.includes(interaction.commandName)) {
@@ -993,6 +998,8 @@ async function initDiscordBot() {
               await handleRoundSummary(interaction);
             } else if (interaction.commandName === 'exportround') {
               await handleExportRound(interaction);
+            } else if (interaction.commandName === 'lockdown') {
+              await handleLockdown(interaction);
             } else {
               await interaction.reply({ content: `🛠️ Command \`/${interaction.commandName}\` is under construction.`, flags: MessageFlags.Ephemeral });
             }
@@ -4829,6 +4836,52 @@ async function handleExportRound(interaction: any) {
     content: `✅ Round ${roundNum} export — **${snapshot.size}** order(s).`,
     files: [file],
   });
+}
+
+async function handleLockdown(interaction: any) {
+  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+
+  const staffRole = interaction.options.getRole('staff_role');
+  const targetChannel = interaction.options.getChannel('channel') || interaction.channel;
+  const config = await getGuildConfig(interaction.guildId!) || {};
+
+  // Collect all channels to lock
+  const channelIds: Set<string> = new Set([targetChannel.id]);
+  if (config.statusChannelId) channelIds.add(config.statusChannelId);
+
+  const everyoneRole = interaction.guild.roles.everyone;
+  const results: string[] = [];
+
+  for (const channelId of channelIds) {
+    try {
+      const channel = channelId === targetChannel.id
+        ? targetChannel
+        : await interaction.guild.channels.fetch(channelId);
+
+      if (!channel || !channel.permissionOverwrites) {
+        results.push(`⚠️ <#${channelId}> — not a lockable channel, skipped`);
+        continue;
+      }
+
+      // Hide from everyone
+      await channel.permissionOverwrites.edit(everyoneRole, { ViewChannel: false });
+      // Grant staff role read access
+      await channel.permissionOverwrites.edit(staffRole, { ViewChannel: true, ReadMessageHistory: true });
+      // Ensure the bot retains access to post
+      await channel.permissionOverwrites.edit(interaction.client.user.id, { ViewChannel: true, SendMessages: true });
+
+      results.push(`🔒 <#${channelId}> — now private (${staffRole.name} + admins only)`);
+    } catch (err: any) {
+      console.error(`Failed to lock channel ${channelId}:`, err);
+      results.push(`❌ <#${channelId}> — failed: ${err.message}`);
+    }
+  }
+
+  const embed = createEmbed(config)
+    .setTitle('🔒 Channel Lockdown')
+    .setDescription(results.join('\n') + `\n\n**Staff role granted access:** ${staffRole}\n\nMake sure the bot has **Manage Channels** permission if any failed.`);
+
+  await interaction.editReply({ embeds: [embed] });
 }
 
 async function handleFormatOrderFoodie(interaction: any) {
