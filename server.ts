@@ -2062,9 +2062,10 @@ async function initDiscordBot() {
                 if (config.zelleEmail) {
                   buttons.push(new ButtonBuilder().setCustomId('pay_zelle').setLabel('🟣 Pay with Zelle').setStyle(ButtonStyle.Secondary));
                 }
-                if (config.cryptoAddress) {
-                  buttons.push(new ButtonBuilder().setCustomId('pay_crypto').setLabel('🪙 Pay with Crypto').setStyle(ButtonStyle.Secondary));
-                }
+                // CRYPTO HIDDEN — uncomment to re-enable Crypto at checkout
+                // if (config.cryptoAddress) {
+                //   buttons.push(new ButtonBuilder().setCustomId('pay_crypto').setLabel('🪙 Pay with Crypto').setStyle(ButtonStyle.Secondary));
+                // }
 
                 const backBtn = new ButtonBuilder().setCustomId('back_to_review').setLabel('Back').setStyle(ButtonStyle.Danger);
                 
