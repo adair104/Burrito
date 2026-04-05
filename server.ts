@@ -3658,6 +3658,29 @@ async function showPerOrderNamePrompt(interaction: any, state: any) {
   await interaction[method]({ content: `What name should go on **Entree #${orderNum}**?`, components: [row], embeds: [], flags: MessageFlags.Ephemeral });
 }
 
+function getEntreeEmoji(type: string): string {
+  if (type === 'Burrito Bowl') return '🥗';
+  if (type === 'Salad Bowl') return '🥙';
+  if (type === 'Quesadilla') return '🧀';
+  if (type === 'Tacos') return '🌮';
+  return '🌯';
+}
+
+function buildOrderBreadcrumb(state: any): string {
+  const o = state.currentOrder;
+  if (!o?.type) return '';
+  const parts: string[] = [`${getEntreeEmoji(o.type)} ${o.type}`];
+  if (o.proteins?.[0]) parts.push(o.isDouble ? `Double ${o.proteins[0]}` : o.proteins[0]);
+  if (o.rice?.type && o.rice.type !== 'None') parts.push(o.rice.type);
+  if (o.beans?.type && o.beans.type !== 'None') parts.push(o.beans.type);
+  return parts.join(' · ');
+}
+
+async function getStepConfig(interaction: any, state: any) {
+  if (!state.config) state.config = await getGuildConfig(interaction.guildId || state.guildId) || {};
+  return state.config;
+}
+
 async function showEntreeSelect(interaction: any, state: any) {
   // If per-order naming is enabled and we don't yet have a name for this entree (not editing)
   const isEditing = state.editingIndex !== null && state.editingIndex !== undefined;
@@ -3665,8 +3688,14 @@ async function showEntreeSelect(interaction: any, state: any) {
     return await showPerOrderNamePrompt(interaction, state);
   }
 
-  const config = await getGuildConfig(interaction.guildId || state.guildId) || {};
-  const entreePrompt = config.entreePrompt || 'Choose your entree:';
+  const config = await getStepConfig(interaction, state);
+  const entreePrompt = config.entreePrompt || 'What would you like to order?';
+  const itemNum = state.orders.length + 1;
+  const title = state.orders.length === 0 ? '🛒 Start Your Order' : `🛒 Add Item #${itemNum}`;
+
+  const embed = createEmbed(config)
+    .setTitle(title)
+    .setDescription(entreePrompt);
 
   const select = new StringSelectMenuBuilder()
     .setCustomId('entree_select')
@@ -3679,21 +3708,26 @@ async function showEntreeSelect(interaction: any, state: any) {
       { label: '🌮 Tacos', value: 'Tacos' },
     );
   const row = new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(select);
-  
+
   const components: any[] = [row];
   if (state.orders && state.orders.length > 0) {
-    const backBtn = new ButtonBuilder().setCustomId('back_to_review').setLabel('Back to Review').setStyle(ButtonStyle.Danger);
+    const backBtn = new ButtonBuilder().setCustomId('back_to_review').setLabel('◀ Back to Cart').setStyle(ButtonStyle.Secondary);
     const backRow = new ActionRowBuilder<ButtonBuilder>().addComponents(backBtn);
     components.push(backRow);
   }
 
   const method = interaction.replied || interaction.deferred ? 'editReply' : (interaction.isButton() || interaction.isStringSelectMenu() ? 'update' : 'reply');
-  await interaction[method]({ content: entreePrompt, components, embeds: [], flags: MessageFlags.Ephemeral });
+  await interaction[method]({ content: '', embeds: [embed], components, flags: MessageFlags.Ephemeral });
 }
 
 async function showProteinSelect(interaction: any, state: any) {
-  const config = await getGuildConfig(interaction.guildId || state.guildId) || {};
-  const proteinPrompt = config.proteinPrompt || 'Now choose your protein:';
+  const config = await getStepConfig(interaction, state);
+  const proteinPrompt = config.proteinPrompt || 'Choose your protein:';
+  const entree = state.currentOrder.type;
+
+  const embed = createEmbed(config)
+    .setTitle(`${getEntreeEmoji(entree)} ${entree}`)
+    .setDescription(proteinPrompt);
 
   const select = new StringSelectMenuBuilder()
     .setCustomId('protein_select')
@@ -3710,73 +3744,114 @@ async function showProteinSelect(interaction: any, state: any) {
       { label: '🥦 Veggie', value: 'Veggie' },
     );
   const row = new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(select);
-  const backBtn = new ButtonBuilder().setCustomId('back_to_entree').setLabel('Back').setStyle(ButtonStyle.Danger);
+  const backBtn = new ButtonBuilder().setCustomId('back_to_entree').setLabel('◀ Back').setStyle(ButtonStyle.Secondary);
   const backRow = new ActionRowBuilder<ButtonBuilder>().addComponents(backBtn);
-  await interaction.update({ content: `Selected: **${state.currentOrder.type}**. ${proteinPrompt}`, components: [row, backRow] });
+  await interaction.update({ content: '', embeds: [embed], components: [row, backRow] });
 }
 
 async function showProteinPortion(interaction: any, state: any) {
+  const config = await getStepConfig(interaction, state);
+  const breadcrumb = buildOrderBreadcrumb(state);
+
+  const embed = createEmbed(config)
+    .setTitle('💪 Protein Portion')
+    .setDescription(`**${state.currentOrder.proteins.join(', ')}** — Regular or double?\n\n-# ${breadcrumb}`);
+
   const doubleBtn = new ButtonBuilder().setCustomId('protein_double').setLabel('💪 Double Protein').setStyle(ButtonStyle.Primary);
-  const skipBtn = new ButtonBuilder().setCustomId('protein_skip').setLabel('✅ Regular Portion').setStyle(ButtonStyle.Secondary);
-  const backBtn = new ButtonBuilder().setCustomId('back_to_protein_select').setLabel('◀️ Back').setStyle(ButtonStyle.Danger);
+  const skipBtn = new ButtonBuilder().setCustomId('protein_skip').setLabel('Regular').setStyle(ButtonStyle.Secondary);
+  const backBtn = new ButtonBuilder().setCustomId('back_to_protein_select').setLabel('◀ Back').setStyle(ButtonStyle.Secondary);
   const row = new ActionRowBuilder<ButtonBuilder>().addComponents(doubleBtn, skipBtn, backBtn);
-  await interaction.update({ content: `🥩 Protein: **${state.currentOrder.proteins.join(', ')}**. Would you like double protein?`, components: [row] });
+  await interaction.update({ content: '', embeds: [embed], components: [row] });
 }
 
 async function showRiceSelect(interaction: any, state: any) {
+  const config = await getStepConfig(interaction, state);
+  const breadcrumb = buildOrderBreadcrumb(state);
+
+  const embed = createEmbed(config)
+    .setTitle('🍚 Rice')
+    .setDescription(`Choose your rice:\n\n-# ${breadcrumb}`);
+
   const select = new StringSelectMenuBuilder()
     .setCustomId('rice_select')
     .setPlaceholder('Choose Rice')
     .addOptions(
       { label: '🍚 White Rice', value: 'White Rice' },
       { label: '🌾 Brown Rice', value: 'Brown Rice' },
-      { label: '❌ None', value: 'None' },
+      { label: '❌ No Rice', value: 'None' },
     );
   const row = new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(select);
-  const backBtn = new ButtonBuilder().setCustomId('back_to_protein_portion').setLabel('◀️ Back').setStyle(ButtonStyle.Danger);
+  const backBtn = new ButtonBuilder().setCustomId('back_to_protein_portion').setLabel('◀ Back').setStyle(ButtonStyle.Secondary);
   const backRow = new ActionRowBuilder<ButtonBuilder>().addComponents(backBtn);
-  await interaction.update({ content: '🍚 Choose your rice:', components: [row, backRow] });
+  await interaction.update({ content: '', embeds: [embed], components: [row, backRow] });
 }
 
 async function showRicePortion(interaction: any, state: any) {
+  const config = await getStepConfig(interaction, state);
+  const breadcrumb = buildOrderBreadcrumb(state);
+
+  const embed = createEmbed(config)
+    .setTitle('🍚 Rice Portion')
+    .setDescription(`**${state.currentOrder.rice.type}** — how much?\n\n-# ${breadcrumb}`);
+
   const row = createPortionRow('rice_portion');
-  const backBtn = new ButtonBuilder().setCustomId('back_to_rice_select').setLabel('Back').setStyle(ButtonStyle.Danger);
+  const backBtn = new ButtonBuilder().setCustomId('back_to_rice_select').setLabel('◀ Back').setStyle(ButtonStyle.Secondary);
   row.addComponents(backBtn);
-  await interaction.update({ content: `🍚 Rice: **${state.currentOrder.rice.type}**. Choose portion:`, components: [row] });
+  await interaction.update({ content: '', embeds: [embed], components: [row] });
 }
 
 async function showBeansSelect(interaction: any, state: any) {
+  const config = await getStepConfig(interaction, state);
+  const breadcrumb = buildOrderBreadcrumb(state);
+
+  const embed = createEmbed(config)
+    .setTitle('🫘 Beans')
+    .setDescription(`Choose your beans:\n\n-# ${breadcrumb}`);
+
   const select = new StringSelectMenuBuilder()
     .setCustomId('beans_select')
     .setPlaceholder('Choose Beans')
     .addOptions(
       { label: '⚫ Black Beans', value: 'Black Beans' },
       { label: '🟤 Pinto Beans', value: 'Pinto Beans' },
-      { label: '❌ None', value: 'None' },
+      { label: '❌ No Beans', value: 'None' },
     );
   const row = new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(select);
   const backId = state.currentOrder.rice.type === 'None' ? 'back_to_rice_select' : 'back_to_rice_portion';
-  const backBtn = new ButtonBuilder().setCustomId(backId).setLabel('Back').setStyle(ButtonStyle.Danger);
+  const backBtn = new ButtonBuilder().setCustomId(backId).setLabel('◀ Back').setStyle(ButtonStyle.Secondary);
   const backRow = new ActionRowBuilder<ButtonBuilder>().addComponents(backBtn);
-  await interaction.update({ content: '🫘 Choose your beans:', components: [row, backRow] });
+  await interaction.update({ content: '', embeds: [embed], components: [row, backRow] });
 }
 
 async function showBeansPortion(interaction: any, state: any) {
+  const config = await getStepConfig(interaction, state);
+  const breadcrumb = buildOrderBreadcrumb(state);
+
+  const embed = createEmbed(config)
+    .setTitle('🫘 Beans Portion')
+    .setDescription(`**${state.currentOrder.beans.type}** — how much?\n\n-# ${breadcrumb}`);
+
   const row = createPortionRow('beans_portion');
-  const backBtn = new ButtonBuilder().setCustomId('back_to_beans_select').setLabel('Back').setStyle(ButtonStyle.Danger);
+  const backBtn = new ButtonBuilder().setCustomId('back_to_beans_select').setLabel('◀ Back').setStyle(ButtonStyle.Secondary);
   row.addComponents(backBtn);
-  await interaction.update({ content: `🫘 Beans: **${state.currentOrder.beans.type}**. Choose portion:`, components: [row] });
+  await interaction.update({ content: '', embeds: [embed], components: [row] });
 }
 
 async function showToppingsSelect(interaction: any, state: any) {
+  const config = await getStepConfig(interaction, state);
+  const breadcrumb = buildOrderBreadcrumb(state);
   const entreeType = state.currentOrder.type;
   let maxToppings = 8;
   if (entreeType === 'Quesadilla') maxToppings = 2;
   if (entreeType === 'Tacos') maxToppings = 4;
 
+  const embed = createEmbed(config)
+    .setTitle('🥗 Toppings')
+    .setDescription(`Select all that apply${maxToppings < 8 ? ` (up to ${maxToppings})` : ''}:\n\n-# ${breadcrumb}`);
+
   const select = new StringSelectMenuBuilder()
     .setCustomId('toppings_select')
-    .setPlaceholder('Choose Toppings')
+    .setPlaceholder('Choose Toppings (or skip)')
     .setMinValues(0)
     .setMaxValues(maxToppings)
     .addOptions(
@@ -3791,24 +3866,39 @@ async function showToppingsSelect(interaction: any, state: any) {
     );
   const row = new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(select);
   const backId = state.currentOrder.beans.type === 'None' ? 'back_to_beans_select' : 'back_to_beans_portion';
-  const backBtn = new ButtonBuilder().setCustomId(backId).setLabel('Back').setStyle(ButtonStyle.Danger);
+  const backBtn = new ButtonBuilder().setCustomId(backId).setLabel('◀ Back').setStyle(ButtonStyle.Secondary);
   const backRow = new ActionRowBuilder<ButtonBuilder>().addComponents(backBtn);
-  await interaction.update({ content: '🥗 Choose your toppings (select all that apply):', components: [row, backRow] });
+  await interaction.update({ content: '', embeds: [embed], components: [row, backRow] });
 }
 
 async function showToppingPortion(interaction: any, state: any, index: number) {
+  const config = await getStepConfig(interaction, state);
   const topping = state.currentOrder.selectedToppings[index];
+  const total = state.currentOrder.selectedToppings.length;
+  const breadcrumb = buildOrderBreadcrumb(state);
+
+  const embed = createEmbed(config)
+    .setTitle(`🧂 ${topping}`)
+    .setDescription(`Portion for **${topping}**${total > 1 ? ` (${index + 1} of ${total})` : ''}:\n\n-# ${breadcrumb}`);
+
   const row = createPortionRow(`topping_portion_${index}`);
   const backId = index === 0 ? 'back_to_toppings_select' : `back_to_topping_${index - 1}`;
-  const backBtn = new ButtonBuilder().setCustomId(backId).setLabel('Back').setStyle(ButtonStyle.Danger);
+  const backBtn = new ButtonBuilder().setCustomId(backId).setLabel('◀ Back').setStyle(ButtonStyle.Secondary);
   row.addComponents(backBtn);
-  await interaction.update({ content: `🧂 Topping: **${topping}**. Choose portion:`, components: [row] });
+  await interaction.update({ content: '', embeds: [embed], components: [row] });
 }
 
 async function showPremiumSelect(interaction: any, state: any) {
+  const config = await getStepConfig(interaction, state);
+  const breadcrumb = buildOrderBreadcrumb(state);
+
+  const embed = createEmbed(config)
+    .setTitle('⭐ Premium Add-ons')
+    .setDescription(`Add guacamole or queso? (optional)\n\n-# ${breadcrumb}`);
+
   const select = new StringSelectMenuBuilder()
     .setCustomId('premium_select')
-    .setPlaceholder('Choose Premium Topping(s)')
+    .setPlaceholder('Choose premium add-on(s) or skip')
     .setMinValues(1)
     .setMaxValues(3)
     .addOptions(
@@ -3818,13 +3908,13 @@ async function showPremiumSelect(interaction: any, state: any) {
     );
   const row = new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(select);
   const backId = state.currentOrder.selectedToppings.length === 0 ? 'back_to_toppings_select' : `back_to_topping_${state.currentOrder.selectedToppings.length - 1}`;
-  const backBtn = new ButtonBuilder().setCustomId(backId).setLabel('Back').setStyle(ButtonStyle.Danger);
+  const backBtn = new ButtonBuilder().setCustomId(backId).setLabel('◀ Back').setStyle(ButtonStyle.Secondary);
   const backRow = new ActionRowBuilder<ButtonBuilder>().addComponents(backBtn);
-  await interaction.update({ content: '⭐ Add a premium topping (optional):', components: [row, backRow] });
+  await interaction.update({ content: '', embeds: [embed], components: [row, backRow] });
 }
 
 async function showReview(interaction: any, state: any) {
-  const config = await getGuildConfig(interaction.guildId || state.guildId) || {};
+  const config = await getStepConfig(interaction, state);
   const basePrice = config.basePrice || 5.00;
   const bulkPrice = config.bulkPrice;
   const bulkThreshold = config.bulkThreshold;
@@ -3833,49 +3923,43 @@ async function showReview(interaction: any, state: any) {
   const currentBasePrice = (bulkPrice && bulkThreshold && numEntrees >= bulkThreshold) ? bulkPrice : basePrice;
 
   const embed = createEmbed(config)
-    .setTitle('🛒 Your Order Summary')
-    .setDescription(`You have **${numEntrees}** item(s) in your cart. Review your selection below before proceeding to checkout.`);
+    .setTitle('🛒 Your Cart')
+    .setDescription(`**${numEntrees}** item${numEntrees !== 1 ? 's' : ''} · Review before checkout`);
 
   let grandTotal = 0;
 
   state.orders.forEach((order: any, i: number) => {
-    let itemPrice = currentBasePrice;
-
+    const itemPrice = currentBasePrice;
     const proteinStr = order.isDouble ? `Double ${order.proteins[0]}` : order.proteins[0] || 'Veggie';
-    
-    let optionsStr = `**Protein:** ${proteinStr}\n`;
-    optionsStr += `**Rice:** ${order.rice.portion && order.rice.portion !== 'Regular' ? `${order.rice.portion} ` : ''}${order.rice.type}\n`;
-    optionsStr += `**Beans:** ${order.beans.portion && order.beans.portion !== 'Regular' ? `${order.beans.portion} ` : ''}${order.beans.type}\n`;
-    
+    const ricePortionPrefix = order.rice.portion && order.rice.portion !== 'Regular' ? `${order.rice.portion} ` : '';
+    const beansPortionPrefix = order.beans.portion && order.beans.portion !== 'Regular' ? `${order.beans.portion} ` : '';
+
+    const lines: string[] = [
+      `🥩 ${proteinStr}`,
+      `🍚 ${ricePortionPrefix}${order.rice.type}`,
+      `🫘 ${beansPortionPrefix}${order.beans.type}`,
+    ];
+
     if (order.toppings && order.toppings.length > 0) {
-      const toppingsList = order.toppings.map((t: any) => t.portion === 'Regular' ? `${t.type}` : `${t.portion} ${t.type}`).join('\n');
-      optionsStr += `**Toppings:**\n${toppingsList}\n`;
+      const toppingsList = order.toppings.map((t: any) => t.portion === 'Regular' ? t.type : `${t.portion} ${t.type}`).join(', ');
+      lines.push(`🧂 ${toppingsList}`);
     }
 
     if (order.premiums && order.premiums.length > 0) {
-      optionsStr += `**Premium:** ${order.premiums.join(', ')}\n`;
+      lines.push(`⭐ ${order.premiums.join(', ')}`);
     }
 
-    if (order.isDouble) {
-      optionsStr += `*(Double Protein)*\n`;
-    }
-
-    optionsStr += `**Item Total: $${itemPrice.toFixed(2)}**`;
+    lines.push(`**$${itemPrice.toFixed(2)}**`);
     grandTotal += itemPrice;
 
     const orderTitle = state.askNamePerOrder && order.name
-      ? `${i + 1}. ${order.type} — ${order.name}`
-      : `${i + 1}. ${order.type}`;
-    embed.addFields({
-      name: orderTitle,
-      value: optionsStr
-    });
+      ? `${getEntreeEmoji(order.type)} ${i + 1}. ${order.type} — ${order.name}`
+      : `${getEntreeEmoji(order.type)} ${i + 1}. ${order.type}`;
+
+    embed.addFields({ name: orderTitle, value: lines.join('\n') });
   });
 
-  embed.addFields({
-    name: '━━━━━━━━━━━━━━━━━━━━━━━━',
-    value: `### **Total Amount: $${grandTotal.toFixed(2)}**`
-  });
+  embed.addFields({ name: ' ', value: `**Order Total: $${grandTotal.toFixed(2)}**` });
 
   const maxEntrees: number = state.maxEntrees || 9;
   const atMax = state.orders.length >= maxEntrees;
@@ -3884,17 +3968,17 @@ async function showReview(interaction: any, state: any) {
   const addBtn = addLabel
     ? new ButtonBuilder().setCustomId('add_more').setLabel(addLabel).setStyle(ButtonStyle.Secondary)
     : null;
-  const editBtn = new ButtonBuilder().setCustomId('edit_order_start').setLabel('✏️ Edit Order').setStyle(ButtonStyle.Primary);
-  const removeBtn = new ButtonBuilder().setCustomId('remove_item_start').setLabel('🗑️ Remove Item').setStyle(ButtonStyle.Danger);
+  const editBtn = new ButtonBuilder().setCustomId('edit_order_start').setLabel('✏️ Edit').setStyle(ButtonStyle.Primary);
+  const removeBtn = new ButtonBuilder().setCustomId('remove_item_start').setLabel('🗑️ Remove').setStyle(ButtonStyle.Danger);
   const checkoutBtn = state.isManual
     ? new ButtonBuilder().setCustomId('confirm_manual').setLabel('✅ Confirm & Print').setStyle(ButtonStyle.Success)
-    : new ButtonBuilder().setCustomId('checkout').setLabel('💳 Proceed to Checkout').setStyle(ButtonStyle.Success);
-  const backBtn = new ButtonBuilder().setCustomId('back_to_premium').setLabel('Back').setStyle(ButtonStyle.Secondary);
+    : new ButtonBuilder().setCustomId('checkout').setLabel('💳 Checkout').setStyle(ButtonStyle.Success);
+  const backBtn = new ButtonBuilder().setCustomId('back_to_premium').setLabel('◀ Back').setStyle(ButtonStyle.Secondary);
 
   const rowBtns = [editBtn, removeBtn, checkoutBtn, backBtn];
   if (addBtn) rowBtns.unshift(addBtn);
   const row = new ActionRowBuilder<ButtonBuilder>().addComponents(rowBtns);
-  
+
   const method = interaction.replied || interaction.deferred ? 'editReply' : 'update';
   await interaction[method]({ content: '', embeds: [embed], components: [row] });
 }
