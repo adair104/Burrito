@@ -2947,7 +2947,7 @@ async function handleAnnouncements(interaction: any) {
 
   const config = await getGuildConfig(interaction.guildId) || {};
   const embed = createEmbed(config)
-    .setDescription(message);
+    .setDescription(`# **${message}**`);
     
   if (title) embed.setTitle(title);
   if (imageUrl) embed.setImage(imageUrl);
