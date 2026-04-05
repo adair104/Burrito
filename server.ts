@@ -2440,6 +2440,10 @@ async function initDiscordBot() {
               if (state.editingIndex !== null && state.editingIndex !== undefined) {
                 state.orders.splice(state.editingIndex, 0, state.currentOrder);
                 state.editingIndex = null;
+              } else {
+                // Clear any partially-built currentOrder so back_to_premium doesn't
+                // mistake it for a completed item and skip popping from state.orders.
+                state.currentOrder = { type: '', proteins: [], rice: { type: 'None' }, beans: { type: 'None' }, toppings: [], selectedToppings: [], premiums: [] };
               }
               await showReview(interaction, state);
             } else if (interaction.customId === 'back_to_entree') {
