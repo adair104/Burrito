@@ -2201,7 +2201,8 @@ async function initDiscordBot() {
                       const parsedOrders = safeParseOrders(orderDoc.data()?.orderData);
                       const orderDetails = formatOrderItems(parsedOrders);
 
-                      await fulfillOrder(pollerOrderId, true);
+                      // Pass notifyUser=false — the poller owns the screen update and DM fallback below
+                      await fulfillOrder(pollerOrderId, false);
 
                       // Update the customer's Discord screen
                       if (storedInteraction) {
@@ -2212,7 +2213,14 @@ async function initDiscordBot() {
                             .setDescription(`${successMsg}\n\n**Your Order Details:**\n${orderDetails}`);
                           await storedInteraction.editReply({ content: '', embeds: [successEmbed], components: [] });
                         } catch (e) {
-                          console.error('Could not update screen after payment (token may have expired):', e);
+                          // Token expired (>15 min) — fall back to DM
+                          console.error('Could not update screen after payment (token expired), sending DM:', e);
+                          try {
+                            const user = await client.users.fetch(pollerUserId);
+                            await user.send(`🎉 Payment confirmed! Your order has been sent to the kitchen.\n\n**Your Order Details:**\n${orderDetails}`);
+                          } catch (dmErr) {
+                            console.error('Could not send DM fallback after failed screen update:', dmErr);
+                          }
                         }
                       }
                     } else if (sess.status === 'expired') {
