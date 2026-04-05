@@ -2049,8 +2049,9 @@ async function initDiscordBot() {
                 state.totalPrice = totalPrice;
 
                 const buttons: ButtonBuilder[] = [];
-                const stripeBtn = new ButtonBuilder().setCustomId('pay_stripe').setLabel('💳 Pay with Stripe').setStyle(ButtonStyle.Primary);
-                buttons.push(stripeBtn);
+                // STRIPE HIDDEN — uncomment to re-enable Stripe at checkout
+                // const stripeBtn = new ButtonBuilder().setCustomId('pay_stripe').setLabel('💳 Pay with Stripe').setStyle(ButtonStyle.Primary);
+                // buttons.push(stripeBtn);
 
                 if (config.cashappTag) {
                   buttons.push(new ButtonBuilder().setCustomId('pay_cashapp').setLabel('💸 Pay with Cash App').setStyle(ButtonStyle.Success));
